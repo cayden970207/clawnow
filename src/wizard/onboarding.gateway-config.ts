@@ -40,6 +40,7 @@ type ConfigureGatewayOptions = {
   nextConfig: OpenClawConfig;
   localPort: number;
   quickstartGateway: QuickstartGatewayDefaults;
+  skipGatewaySetup?: boolean;
   prompter: WizardPrompter;
   runtime: RuntimeEnv;
 };
@@ -49,11 +50,76 @@ type ConfigureGatewayResult = {
   settings: GatewayWizardSettings;
 };
 
+function resolveExistingGatewaySettings(params: {
+  config: OpenClawConfig;
+  localPort: number;
+  quickstartGateway: QuickstartGatewayDefaults;
+}): GatewayWizardSettings {
+  const bindRaw = params.config.gateway?.bind;
+  const bind: GatewayWizardSettings["bind"] =
+    bindRaw === "loopback" ||
+    bindRaw === "lan" ||
+    bindRaw === "auto" ||
+    bindRaw === "custom" ||
+    bindRaw === "tailnet"
+      ? bindRaw
+      : params.quickstartGateway.bind;
+
+  const authModeRaw = params.config.gateway?.auth?.mode;
+  const authMode: GatewayAuthChoice =
+    authModeRaw === "token" || authModeRaw === "password" || authModeRaw === "trusted-proxy"
+      ? authModeRaw
+      : params.quickstartGateway.authMode;
+
+  const tokenRaw = params.config.gateway?.auth?.token;
+  const gatewayToken =
+    authMode === "token"
+      ? typeof tokenRaw === "string" && tokenRaw.trim().length > 0
+        ? tokenRaw.trim()
+        : params.quickstartGateway.token
+      : undefined;
+
+  const tailscaleModeRaw = params.config.gateway?.tailscale?.mode;
+  const tailscaleMode: GatewayWizardSettings["tailscaleMode"] =
+    tailscaleModeRaw === "off" || tailscaleModeRaw === "serve" || tailscaleModeRaw === "funnel"
+      ? tailscaleModeRaw
+      : params.quickstartGateway.tailscaleMode;
+
+  return {
+    port:
+      typeof params.config.gateway?.port === "number" && Number.isFinite(params.config.gateway.port)
+        ? params.config.gateway.port
+        : params.localPort,
+    bind,
+    customBindHost:
+      bind === "custom"
+        ? (params.config.gateway?.customBindHost ?? params.quickstartGateway.customBindHost)
+        : undefined,
+    authMode,
+    gatewayToken,
+    tailscaleMode,
+    tailscaleResetOnExit:
+      params.config.gateway?.tailscale?.resetOnExit ??
+      params.quickstartGateway.tailscaleResetOnExit,
+  };
+}
+
 export async function configureGatewayForOnboarding(
   opts: ConfigureGatewayOptions,
 ): Promise<ConfigureGatewayResult> {
   const { flow, localPort, quickstartGateway, prompter } = opts;
   let { nextConfig } = opts;
+
+  if (opts.skipGatewaySetup) {
+    return {
+      nextConfig,
+      settings: resolveExistingGatewaySettings({
+        config: nextConfig,
+        localPort,
+        quickstartGateway,
+      }),
+    };
+  }
 
   const port =
     flow === "quickstart"

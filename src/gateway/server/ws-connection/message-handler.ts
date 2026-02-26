@@ -34,6 +34,10 @@ import {
 } from "../../canvas-capability.js";
 import { buildDeviceAuthPayload } from "../../device-auth.js";
 import {
+  ensureManagedTrustedProxies,
+  isManagedTrustedProxyEnabled,
+} from "../../managed-trusted-proxy.js";
+import {
   isLocalishHost,
   isLoopbackAddress,
   isTrustedProxyAddress,
@@ -149,7 +153,9 @@ export function attachGatewayWsMessageHandler(params: {
   } = params;
 
   const configSnapshot = loadConfig();
-  const trustedProxies = configSnapshot.gateway?.trustedProxies ?? [];
+  const trustedProxies = isManagedTrustedProxyEnabled(process.env)
+    ? ensureManagedTrustedProxies(configSnapshot.gateway?.trustedProxies)
+    : (configSnapshot.gateway?.trustedProxies ?? []);
   const allowRealIpFallback = configSnapshot.gateway?.allowRealIpFallback === true;
   const clientIp = resolveClientIp({
     remoteAddr,

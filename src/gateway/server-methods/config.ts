@@ -34,6 +34,10 @@ import {
   summarizeChangedPaths,
 } from "../control-plane-audit.js";
 import {
+  enforceManagedTrustedProxyGatewayConfig,
+  isManagedTrustedProxyEnabled,
+} from "../managed-trusted-proxy.js";
+import {
   ErrorCodes,
   errorShape,
   validateConfigApplyParams,
@@ -46,6 +50,10 @@ import { resolveBaseHashParam } from "./base-hash.js";
 import { parseRestartRequestParams } from "./restart-request.js";
 import type { GatewayRequestHandlers, RespondFn } from "./types.js";
 import { assertValidParams } from "./validation.js";
+
+const MANAGED_TRUSTED_PROXY_LOCK_CODE = "MANAGED_GATEWAY_LOCKED";
+const MANAGED_TRUSTED_PROXY_LOCK_MESSAGE =
+  "gateway auth mode is managed by platform and locked to trusted-proxy";
 
 function requireConfigBaseHash(
   params: unknown,
@@ -243,6 +251,101 @@ function loadSchemaWithPlugins(): ConfigSchemaResponse {
   });
 }
 
+function preserveTrustedProxyGatewayDefaults(
+  incomingConfig: OpenClawConfig,
+  snapshotConfig: OpenClawConfig,
+): OpenClawConfig {
+  const snapshotGateway = snapshotConfig.gateway;
+  const managed = isManagedTrustedProxyEnabled(process.env);
+  const shouldPreserve = snapshotGateway?.auth?.mode === "trusted-proxy";
+  if (!managed && !shouldPreserve) {
+    return incomingConfig;
+  }
+
+  const nextConfig = structuredClone(incomingConfig);
+  nextConfig.gateway = nextConfig.gateway || {};
+
+  if (snapshotGateway) {
+    nextConfig.gateway.mode ??= snapshotGateway.mode;
+    nextConfig.gateway.trustedProxies ??= snapshotGateway.trustedProxies;
+  }
+
+  const nextGatewayAuth = nextConfig.gateway.auth;
+  const preserveTrustedProxyAuth =
+    nextGatewayAuth?.mode === undefined || nextGatewayAuth.mode === "trusted-proxy";
+  if (preserveTrustedProxyAuth) {
+    nextConfig.gateway.auth = nextConfig.gateway.auth || {};
+    nextConfig.gateway.auth.mode ??= snapshotGateway?.auth?.mode;
+    if (snapshotGateway?.auth?.trustedProxy) {
+      const incomingTrustedProxy = nextConfig.gateway.auth.trustedProxy;
+      const snapshotTrustedProxy = snapshotGateway.auth.trustedProxy;
+      nextConfig.gateway.auth.trustedProxy = incomingTrustedProxy
+        ? {
+            userHeader: incomingTrustedProxy.userHeader ?? snapshotTrustedProxy.userHeader,
+            requiredHeaders:
+              incomingTrustedProxy.requiredHeaders ?? snapshotTrustedProxy.requiredHeaders,
+            allowUsers: incomingTrustedProxy.allowUsers ?? snapshotTrustedProxy.allowUsers,
+          }
+        : { ...snapshotTrustedProxy };
+    }
+  }
+
+  if (snapshotGateway?.controlUi) {
+    nextConfig.gateway.controlUi = nextConfig.gateway.controlUi || {};
+    nextConfig.gateway.controlUi.basePath ??= snapshotGateway.controlUi.basePath;
+    nextConfig.gateway.controlUi.root ??= snapshotGateway.controlUi.root;
+    nextConfig.gateway.controlUi.allowedOrigins ??= snapshotGateway.controlUi.allowedOrigins;
+    if (nextConfig.gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback === undefined) {
+      nextConfig.gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback =
+        snapshotGateway.controlUi.dangerouslyAllowHostHeaderOriginFallback;
+    }
+    if (nextConfig.gateway.controlUi.dangerouslyDisableDeviceAuth === undefined) {
+      nextConfig.gateway.controlUi.dangerouslyDisableDeviceAuth =
+        snapshotGateway.controlUi.dangerouslyDisableDeviceAuth;
+    }
+  }
+
+  return managed ? enforceManagedTrustedProxyGatewayConfig(nextConfig) : nextConfig;
+}
+
+function isManagedTrustedProxyLockEnabled(snapshotConfig: OpenClawConfig): boolean {
+  void snapshotConfig;
+  return isManagedTrustedProxyEnabled(process.env);
+}
+
+function resolveIncomingGatewayAuthMode(config: OpenClawConfig): string | undefined {
+  return config.gateway?.auth?.mode;
+}
+
+function respondManagedTrustedProxyLockError(respond: RespondFn) {
+  respond(
+    false,
+    undefined,
+    errorShape(ErrorCodes.INVALID_REQUEST, MANAGED_TRUSTED_PROXY_LOCK_MESSAGE, {
+      details: {
+        code: MANAGED_TRUSTED_PROXY_LOCK_CODE,
+        requiredMode: "trusted-proxy",
+      },
+    }),
+  );
+}
+
+function rejectIfManagedTrustedProxyViolation(params: {
+  incomingConfig: OpenClawConfig;
+  snapshotConfig: OpenClawConfig;
+  respond: RespondFn;
+}): boolean {
+  if (!isManagedTrustedProxyLockEnabled(params.snapshotConfig)) {
+    return false;
+  }
+  const incomingMode = resolveIncomingGatewayAuthMode(params.incomingConfig);
+  if (incomingMode === undefined || incomingMode === "trusted-proxy") {
+    return false;
+  }
+  respondManagedTrustedProxyLockError(params.respond);
+  return true;
+}
+
 export const configHandlers: GatewayRequestHandlers = {
   "config.get": async ({ params, respond }) => {
     if (!assertValidParams(params, validateConfigGetParams, "config.get", respond)) {
@@ -270,13 +373,39 @@ export const configHandlers: GatewayRequestHandlers = {
     if (!parsed) {
       return;
     }
-    await writeConfigFile(parsed.config, writeOptions);
+    if (
+      snapshot.valid &&
+      rejectIfManagedTrustedProxyViolation({
+        incomingConfig: parsed.config,
+        snapshotConfig: snapshot.config,
+        respond,
+      })
+    ) {
+      return;
+    }
+    const protectedConfig = snapshot.valid
+      ? preserveTrustedProxyGatewayDefaults(parsed.config, snapshot.config)
+      : isManagedTrustedProxyEnabled(process.env)
+        ? enforceManagedTrustedProxyGatewayConfig(parsed.config)
+        : parsed.config;
+    const validatedProtectedConfig = validateConfigObjectWithPlugins(protectedConfig);
+    if (!validatedProtectedConfig.ok) {
+      respond(
+        false,
+        undefined,
+        errorShape(ErrorCodes.INVALID_REQUEST, "invalid config", {
+          details: { issues: validatedProtectedConfig.issues },
+        }),
+      );
+      return;
+    }
+    await writeConfigFile(validatedProtectedConfig.config, writeOptions);
     respond(
       true,
       {
         ok: true,
         path: CONFIG_PATH,
-        config: redactConfigObject(parsed.config, parsed.schema.uiHints),
+        config: redactConfigObject(validatedProtectedConfig.config, parsed.schema.uiHints),
       },
       undefined,
     );
@@ -355,12 +484,22 @@ export const configHandlers: GatewayRequestHandlers = {
       );
       return;
     }
-    const changedPaths = diffConfigPaths(snapshot.config, validated.config);
+    if (
+      rejectIfManagedTrustedProxyViolation({
+        incomingConfig: validated.config,
+        snapshotConfig: snapshot.config,
+        respond,
+      })
+    ) {
+      return;
+    }
+    const protectedConfig = preserveTrustedProxyGatewayDefaults(validated.config, snapshot.config);
+    const changedPaths = diffConfigPaths(snapshot.config, protectedConfig);
     const actor = resolveControlPlaneActor(client);
     context?.logGateway?.info(
       `config.patch write ${formatControlPlaneActor(actor)} changedPaths=${summarizeChangedPaths(changedPaths)} restartReason=config.patch`,
     );
-    await writeConfigFile(validated.config, writeOptions);
+    await writeConfigFile(protectedConfig, writeOptions);
 
     const { sessionKey, note, restartDelayMs, deliveryContext, threadId } =
       resolveConfigRestartRequest(params);
@@ -393,7 +532,7 @@ export const configHandlers: GatewayRequestHandlers = {
       {
         ok: true,
         path: CONFIG_PATH,
-        config: redactConfigObject(validated.config, schemaPatch.uiHints),
+        config: redactConfigObject(protectedConfig, schemaPatch.uiHints),
         restart,
         sentinel: {
           path: sentinelPath,
@@ -415,12 +554,27 @@ export const configHandlers: GatewayRequestHandlers = {
     if (!parsed) {
       return;
     }
-    const changedPaths = diffConfigPaths(snapshot.config, parsed.config);
+    if (
+      snapshot.valid &&
+      rejectIfManagedTrustedProxyViolation({
+        incomingConfig: parsed.config,
+        snapshotConfig: snapshot.config,
+        respond,
+      })
+    ) {
+      return;
+    }
+    const protectedConfig = snapshot.valid
+      ? preserveTrustedProxyGatewayDefaults(parsed.config, snapshot.config)
+      : isManagedTrustedProxyEnabled(process.env)
+        ? enforceManagedTrustedProxyGatewayConfig(parsed.config)
+        : parsed.config;
+    const changedPaths = diffConfigPaths(snapshot.valid ? snapshot.config : {}, protectedConfig);
     const actor = resolveControlPlaneActor(client);
     context?.logGateway?.info(
       `config.apply write ${formatControlPlaneActor(actor)} changedPaths=${summarizeChangedPaths(changedPaths)} restartReason=config.apply`,
     );
-    await writeConfigFile(parsed.config, writeOptions);
+    await writeConfigFile(protectedConfig, writeOptions);
 
     const { sessionKey, note, restartDelayMs, deliveryContext, threadId } =
       resolveConfigRestartRequest(params);
@@ -453,7 +607,7 @@ export const configHandlers: GatewayRequestHandlers = {
       {
         ok: true,
         path: CONFIG_PATH,
-        config: redactConfigObject(parsed.config, parsed.schema.uiHints),
+        config: redactConfigObject(protectedConfig, parsed.schema.uiHints),
         restart,
         sentinel: {
           path: sentinelPath,

@@ -167,7 +167,7 @@ export async function finalizeOnboardingWizard(
         const { programArguments, workingDirectory, environment } = await buildGatewayInstallPlan({
           env: process.env,
           port: settings.port,
-          token: settings.gatewayToken,
+          token: settings.authMode === "token" ? settings.gatewayToken : undefined,
           runtime: daemonRuntime,
           warn: (message, title) => prompter.note(message, title),
           config: nextConfig,
@@ -205,7 +205,7 @@ export async function finalizeOnboardingWizard(
     // Daemon install/restart can briefly flap the WS; wait a bit so health check doesn't false-fail.
     await waitForGatewayReachable({
       url: probeLinks.wsUrl,
-      token: settings.gatewayToken,
+      token: settings.authMode === "token" ? settings.gatewayToken : undefined,
       deadlineMs: 15_000,
     });
     try {
@@ -305,18 +305,28 @@ export async function finalizeOnboardingWizard(
       );
     }
 
-    await prompter.note(
-      [
-        "Gateway token: shared auth for the Gateway + Control UI.",
-        "Stored in: ~/.openclaw/openclaw.json (gateway.auth.token) or OPENCLAW_GATEWAY_TOKEN.",
-        `View token: ${formatCliCommand("openclaw config get gateway.auth.token")}`,
-        `Generate token: ${formatCliCommand("openclaw doctor --generate-gateway-token")}`,
-        "Web UI stores a copy in this browser's localStorage (openclaw.control.settings.v1).",
-        `Open the dashboard anytime: ${formatCliCommand("openclaw dashboard --no-open")}`,
-        "If prompted: paste the token into Control UI settings (or use the tokenized dashboard URL).",
-      ].join("\n"),
-      "Token",
-    );
+    if (settings.authMode === "token" && settings.gatewayToken) {
+      await prompter.note(
+        [
+          "Gateway token: shared auth for the Gateway + Control UI.",
+          "Stored in: ~/.openclaw/openclaw.json (gateway.auth.token) or OPENCLAW_GATEWAY_TOKEN.",
+          `View token: ${formatCliCommand("openclaw config get gateway.auth.token")}`,
+          `Generate token: ${formatCliCommand("openclaw doctor --generate-gateway-token")}`,
+          "Web UI stores a copy in this browser's localStorage (openclaw.control.settings.v1).",
+          `Open the dashboard anytime: ${formatCliCommand("openclaw dashboard --no-open")}`,
+          "If prompted: paste the token into Control UI settings (or use the tokenized dashboard URL).",
+        ].join("\n"),
+        "Token",
+      );
+    } else if (settings.authMode === "trusted-proxy") {
+      await prompter.note(
+        [
+          "Gateway auth is managed by a trusted proxy.",
+          "Control UI should be opened from the managed launch URL issued by your platform.",
+        ].join("\n"),
+        "Gateway auth",
+      );
+    }
 
     hatchChoice = await prompter.select({
       message: "How do you want to hatch your bot?",
@@ -359,7 +369,7 @@ export async function finalizeOnboardingWizard(
       }
       await prompter.note(
         [
-          `Dashboard link (with token): ${authedUrl}`,
+          `Dashboard link${settings.authMode === "token" ? " (with token)" : ""}: ${authedUrl}`,
           controlUiOpened
             ? "Opened in your browser. Keep that tab to control OpenClaw."
             : "Copy/paste this URL in a browser on this machine to control OpenClaw.",
@@ -420,7 +430,7 @@ export async function finalizeOnboardingWizard(
 
     await prompter.note(
       [
-        `Dashboard link (with token): ${authedUrl}`,
+        `Dashboard link${settings.authMode === "token" ? " (with token)" : ""}: ${authedUrl}`,
         controlUiOpened
           ? "Opened in your browser. Keep that tab to control OpenClaw."
           : "Copy/paste this URL in a browser on this machine to control OpenClaw.",

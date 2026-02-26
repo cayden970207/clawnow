@@ -13,6 +13,10 @@ import {
 } from "./auth-rate-limit.js";
 import { resolveGatewayCredentialsFromValues } from "./credentials.js";
 import {
+  enforceManagedTrustedProxyAuthConfig,
+  isManagedTrustedProxyEnabled,
+} from "./managed-trusted-proxy.js";
+import {
   isLocalishHost,
   isLoopbackAddress,
   isTrustedProxyAddress,
@@ -243,6 +247,14 @@ export function resolveGatewayAuth(params: {
     }
   }
   const env = params.env ?? process.env;
+
+  // Platform-managed gateways (ClawNow) must never drift to token/password mode.
+  // Enforce this before credential resolution so we don't accidentally surface
+  // stale tokens in the resolved auth object.
+  if (isManagedTrustedProxyEnabled(env)) {
+    enforceManagedTrustedProxyAuthConfig(authConfig);
+  }
+
   const resolvedCredentials = resolveGatewayCredentialsFromValues({
     configToken: authConfig.token,
     configPassword: authConfig.password,

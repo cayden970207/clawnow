@@ -79,7 +79,7 @@ export type AuthChoiceGroupId =
   | "volcengine"
   | "byteplus"
   | "custom";
-export type GatewayAuthChoice = "token" | "password";
+export type GatewayAuthChoice = "token" | "password" | "trusted-proxy";
 export type ResetScope = "config" | "config+creds+sessions" | "full";
 export type GatewayBind = "loopback" | "lan" | "auto" | "custom" | "tailnet";
 export type TailscaleMode = "off" | "serve" | "funnel";
@@ -141,6 +141,10 @@ export type OnboardOptions = {
   gatewayAuth?: GatewayAuthChoice;
   gatewayToken?: string;
   gatewayPassword?: string;
+  /**
+   * Keep existing gateway auth/network settings and skip gateway setup prompts.
+   */
+  skipGatewaySetup?: boolean;
   tailscale?: TailscaleMode;
   tailscaleResetOnExit?: boolean;
   installDaemon?: boolean;

@@ -44,9 +44,20 @@ export const wizardHandlers: GatewayRequestHandlers = {
       return;
     }
     const sessionId = randomUUID();
+    const profile = params.profile === "clawnow" ? "clawnow" : "default";
     const opts = {
-      mode: params.mode,
+      mode: params.mode ?? "local",
       workspace: typeof params.workspace === "string" ? params.workspace : undefined,
+      ...(profile === "clawnow"
+        ? {
+            flow: "quickstart" as const,
+            acceptRisk: true,
+            skipGatewaySetup: true,
+            installDaemon: false,
+            skipHealth: true,
+            skipUi: true,
+          }
+        : {}),
     };
     const session = new WizardSession((prompter) =>
       context.wizardRunner(opts, defaultRuntime, prompter),

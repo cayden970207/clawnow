@@ -1,5 +1,6 @@
 packages:
   - .
+  - clawnow-control-plane
   - ui
   - packages/*
   - extensions/*

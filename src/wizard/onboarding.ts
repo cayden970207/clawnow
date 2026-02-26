@@ -129,40 +129,44 @@ export async function runOnboardingWizard(
     flow = "advanced";
   }
 
+  const managedGatewayWizard = opts.skipGatewaySetup === true;
+
   if (snapshot.exists) {
     await prompter.note(
       onboardHelpers.summarizeExistingConfig(baseConfig),
       "Existing config detected",
     );
 
-    const action = await prompter.select({
-      message: "Config handling",
-      options: [
-        { value: "keep", label: "Use existing values" },
-        { value: "modify", label: "Update values" },
-        { value: "reset", label: "Reset" },
-      ],
-    });
-
-    if (action === "reset") {
-      const workspaceDefault =
-        baseConfig.agents?.defaults?.workspace ?? onboardHelpers.DEFAULT_WORKSPACE;
-      const resetScope = (await prompter.select({
-        message: "Reset scope",
+    if (!managedGatewayWizard) {
+      const action = await prompter.select({
+        message: "Config handling",
         options: [
-          { value: "config", label: "Config only" },
-          {
-            value: "config+creds+sessions",
-            label: "Config + creds + sessions",
-          },
-          {
-            value: "full",
-            label: "Full reset (config + creds + sessions + workspace)",
-          },
+          { value: "keep", label: "Use existing values" },
+          { value: "modify", label: "Update values" },
+          { value: "reset", label: "Reset" },
         ],
-      })) as ResetScope;
-      await onboardHelpers.handleReset(resetScope, resolveUserPath(workspaceDefault), runtime);
-      baseConfig = {};
+      });
+
+      if (action === "reset") {
+        const workspaceDefault =
+          baseConfig.agents?.defaults?.workspace ?? onboardHelpers.DEFAULT_WORKSPACE;
+        const resetScope = (await prompter.select({
+          message: "Reset scope",
+          options: [
+            { value: "config", label: "Config only" },
+            {
+              value: "config+creds+sessions",
+              label: "Config + creds + sessions",
+            },
+            {
+              value: "full",
+              label: "Full reset (config + creds + sessions + workspace)",
+            },
+          ],
+        })) as ResetScope;
+        await onboardHelpers.handleReset(resetScope, resolveUserPath(workspaceDefault), runtime);
+        baseConfig = {};
+      }
     }
   }
 
@@ -189,7 +193,8 @@ export async function runOnboardingWizard(
     let authMode: GatewayAuthChoice = "token";
     if (
       baseConfig.gateway?.auth?.mode === "token" ||
-      baseConfig.gateway?.auth?.mode === "password"
+      baseConfig.gateway?.auth?.mode === "password" ||
+      baseConfig.gateway?.auth?.mode === "trusted-proxy"
     ) {
       authMode = baseConfig.gateway.auth.mode;
     } else if (baseConfig.gateway?.auth?.token) {
@@ -236,6 +241,9 @@ export async function runOnboardingWizard(
     const formatAuth = (value: GatewayAuthChoice) => {
       if (value === "token") {
         return "Token (default)";
+      }
+      if (value === "trusted-proxy") {
+        return "Trusted proxy (managed)";
       }
       return "Password";
     };
@@ -403,6 +411,7 @@ export async function runOnboardingWizard(
     nextConfig,
     localPort,
     quickstartGateway,
+    skipGatewaySetup: opts.skipGatewaySetup === true,
     prompter,
     runtime,
   });
