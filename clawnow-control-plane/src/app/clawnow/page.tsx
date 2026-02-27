@@ -1,8 +1,8 @@
 "use client";
 
-import { ArrowLeft, ExternalLink, Loader2, RefreshCw, Server, Wrench } from "lucide-react";
+import { ArrowLeft, ExternalLink, Loader2, Monitor, RefreshCw, Server, Wrench } from "lucide-react";
 import { useRouter } from "next/navigation";
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AuthModal } from "@/components/AuthModal";
 import { useAuth } from "@/contexts/authContext";
 
@@ -80,6 +80,8 @@ const CLAWNOW_LOADING_LINES = [
   "Your workspace is almost ready, holding steady.",
 ] as const;
 const DEFAULT_BOOTING_NOTICE = "OpenClaw is warming up. First boot can take around 3-10 minutes.";
+const LIVE_MONITOR_POLL_INTERVAL_MS = 2200;
+const LIVE_MONITOR_ACTIVE_LINGER_MS = 6500;
 
 class ApiError extends Error {
   code: string;
@@ -311,6 +313,30 @@ function isInstanceOnboardingComplete(instance: ClawInstance | null): boolean {
   return typeof completedAt === "string" && completedAt.trim().length > 0;
 }
 
+function normalizeDesktopLiveUrl(rawUrl: string): string {
+  try {
+    const url = new URL(rawUrl);
+    const normalizedPath = url.pathname.toLowerCase();
+    if (
+      !normalizedPath.endsWith("/vnc.html") &&
+      !normalizedPath.endsWith("/vnc_lite.html") &&
+      !normalizedPath.endsWith("/vnc_auto.html")
+    ) {
+      const trimmedPath = url.pathname.replace(/\/+$/, "");
+      url.pathname = `${trimmedPath || ""}/vnc.html`;
+    }
+    if (!url.searchParams.has("autoconnect")) {
+      url.searchParams.set("autoconnect", "1");
+    }
+    if (!url.searchParams.has("resize")) {
+      url.searchParams.set("resize", "remote");
+    }
+    return url.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
 async function parseApiResponse<T>(response: Response): Promise<T> {
   const json = await response.json().catch(() => ({}));
   if (!response.ok || !json.success) {
@@ -332,9 +358,22 @@ export default function ClawNowPage() {
   const [hasLoaded, setHasLoaded] = useState(false);
   const [provisioning, setProvisioning] = useState(false);
   const [recovering, setRecovering] = useState(false);
+  const [repairingGatewayDefaults, setRepairingGatewayDefaults] = useState(false);
+  const [openingDesktopLive, setOpeningDesktopLive] = useState(false);
+  const [desktopLiveActive, setDesktopLiveActive] = useState(false);
+  const [desktopLiveLaunchUrl, setDesktopLiveLaunchUrl] = useState<string | null>(null);
+  const [browserTaskLiveActive, setBrowserTaskLiveActive] = useState(false);
+  const [desktopLiveExpiresAt, setDesktopLiveExpiresAt] = useState<string | null>(null);
   const [openingControlUi, setOpeningControlUi] = useState(false);
   const [refreshingHealth, setRefreshingHealth] = useState(false);
   const [loadingMessageIndex, setLoadingMessageIndex] = useState(0);
+  const desktopLiveWindowRef = useRef<Window | null>(null);
+  const liveIndicatorHoldTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const browserTaskLiveActiveRef = useRef(false);
+  const liveMonitorSessionRef = useRef<{
+    gatewayWebSocketUrl: string;
+    expiresAtMs: number;
+  } | null>(null);
 
   const [onboardingBusy, setOnboardingBusy] = useState(false);
   const [onboardingSessionId, setOnboardingSessionId] = useState<string | null>(null);
@@ -447,6 +486,98 @@ export default function ClawNowPage() {
       setRecovering(false);
     }
   }, [getAuthHeaders]);
+
+  const handleRepairGatewayDefaults = useCallback(async () => {
+    setRepairingGatewayDefaults(true);
+    setError(null);
+    setOnboardingMessage(null);
+    try {
+      const headers = await getAuthHeaders();
+      const response = await fetch("/api/clawnow/instances/repair-defaults", {
+        method: "POST",
+        headers,
+      });
+      const data = await parseApiResponse<{ instance: ClawInstance; changed: boolean }>(response);
+      setInstance(data.instance);
+      setOnboardingMessage(
+        data.changed
+          ? "Channels and browser defaults repaired. Reopen Gateway and refresh Channels."
+          : "Channels and browser defaults are already up to date.",
+      );
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to repair gateway defaults");
+    } finally {
+      setRepairingGatewayDefaults(false);
+    }
+  }, [getAuthHeaders]);
+
+  const handleOpenDesktopLive = useCallback(async () => {
+    const preOpenedPopup = window.open("", "_blank", "noopener,noreferrer");
+    if (preOpenedPopup && preOpenedPopup.document) {
+      preOpenedPopup.document.title = "Opening Desktop Live...";
+      preOpenedPopup.document.body.innerHTML =
+        "<p style='font-family:system-ui;padding:24px;'>Opening Desktop Live...</p>";
+    }
+
+    setOpeningDesktopLive(true);
+    setError(null);
+    setOnboardingMessage(null);
+    try {
+      const headers = await getAuthHeaders();
+      const response = await fetch("/api/clawnow/instances/novnc/session", {
+        method: "POST",
+        headers,
+      });
+      const data = await parseApiResponse<{
+        launchUrl: string;
+        expiresAt: string;
+        durationMinutes: number;
+        instance: ClawInstance;
+      }>(response);
+      const launchUrl = normalizeDesktopLiveUrl(data.launchUrl);
+      setInstance(data.instance);
+      setBrowserTaskLiveActive(false);
+      liveMonitorSessionRef.current = null;
+      setDesktopLiveActive(true);
+      setDesktopLiveLaunchUrl(launchUrl);
+      setDesktopLiveExpiresAt(data.expiresAt);
+
+      let popup = preOpenedPopup;
+      if (popup && !popup.closed) {
+        popup.location.href = launchUrl;
+      } else {
+        popup = window.open(launchUrl, "_blank", "noopener,noreferrer");
+      }
+      desktopLiveWindowRef.current = popup;
+      setOnboardingMessage(
+        popup
+          ? `Desktop Live opened (${data.durationMinutes} min). Keep that tab open to watch browser actions in real time.`
+          : `Desktop Live URL ready (${data.durationMinutes} min), but popup was blocked. Allow popups, then click Re-open Desktop Live.`,
+      );
+    } catch (err: unknown) {
+      if (preOpenedPopup && !preOpenedPopup.closed) {
+        preOpenedPopup.close();
+      }
+      setError(err instanceof Error ? err.message : "Failed to open Desktop Live");
+    } finally {
+      setOpeningDesktopLive(false);
+    }
+  }, [getAuthHeaders]);
+
+  const handleReopenDesktopLive = useCallback(() => {
+    if (!desktopLiveLaunchUrl) {
+      return;
+    }
+    setError(null);
+    const popup = window.open(desktopLiveLaunchUrl, "_blank", "noopener,noreferrer");
+    if (!popup) {
+      setError("Popup was blocked. Please allow popups for this site and try again.");
+      return;
+    }
+    desktopLiveWindowRef.current = popup;
+    setDesktopLiveActive(true);
+    setOnboardingMessage("Desktop Live reopened.");
+  }, [desktopLiveLaunchUrl]);
 
   const handleOpenControlUi = useCallback(async () => {
     setOpeningControlUi(true);
@@ -753,7 +884,46 @@ export default function ClawNowPage() {
     setOnboardingMessage(null);
     setOnboardingOAuthUrl(null);
     setManualWizardMode(false);
+    setDesktopLiveActive(false);
+    setDesktopLiveLaunchUrl(null);
+    setBrowserTaskLiveActive(false);
+    setDesktopLiveExpiresAt(null);
+    desktopLiveWindowRef.current = null;
+    liveMonitorSessionRef.current = null;
   }, [instance?.id]);
+
+  useEffect(() => {
+    browserTaskLiveActiveRef.current = browserTaskLiveActive;
+  }, [browserTaskLiveActive]);
+
+  useEffect(() => {
+    return () => {
+      if (liveIndicatorHoldTimerRef.current) {
+        clearTimeout(liveIndicatorHoldTimerRef.current);
+        liveIndicatorHoldTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!desktopLiveActive) {
+      return;
+    }
+    const timer = setInterval(() => {
+      const popup = desktopLiveWindowRef.current;
+      if (popup && !popup.closed) {
+        return;
+      }
+      setDesktopLiveActive(false);
+      if (liveIndicatorHoldTimerRef.current) {
+        clearTimeout(liveIndicatorHoldTimerRef.current);
+        liveIndicatorHoldTimerRef.current = null;
+      }
+      setBrowserTaskLiveActive(false);
+      liveMonitorSessionRef.current = null;
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [desktopLiveActive]);
 
   useEffect(() => {
     setOnboardingOAuthUrl(null);
@@ -814,6 +984,150 @@ export default function ClawNowPage() {
   const showOAuthLoginShortcut = isRedirectUrlInputStep(onboardingStep);
   const isPreparingOrStarting = isWorkspaceLoading || workspaceStage === "booting";
   const loadingLine = CLAWNOW_LOADING_LINES[loadingMessageIndex];
+  const desktopLiveExpiresLabel = useMemo(() => {
+    if (!desktopLiveExpiresAt) {
+      return null;
+    }
+    const expires = new Date(desktopLiveExpiresAt);
+    if (!Number.isFinite(expires.getTime())) {
+      return null;
+    }
+    return expires.toLocaleTimeString();
+  }, [desktopLiveExpiresAt]);
+
+  useEffect(() => {
+    if (!desktopLiveActive || !canOpenSession || !onboardingCompleted) {
+      if (liveIndicatorHoldTimerRef.current) {
+        clearTimeout(liveIndicatorHoldTimerRef.current);
+        liveIndicatorHoldTimerRef.current = null;
+      }
+      setBrowserTaskLiveActive(false);
+      liveMonitorSessionRef.current = null;
+      return;
+    }
+
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const setBrowserLiveState = (active: boolean) => {
+      if (active) {
+        if (liveIndicatorHoldTimerRef.current) {
+          clearTimeout(liveIndicatorHoldTimerRef.current);
+          liveIndicatorHoldTimerRef.current = null;
+        }
+        setBrowserTaskLiveActive(true);
+        return;
+      }
+      if (!browserTaskLiveActiveRef.current) {
+        return;
+      }
+      if (liveIndicatorHoldTimerRef.current) {
+        return;
+      }
+      liveIndicatorHoldTimerRef.current = setTimeout(() => {
+        liveIndicatorHoldTimerRef.current = null;
+        setBrowserTaskLiveActive(false);
+      }, LIVE_MONITOR_ACTIVE_LINGER_MS);
+    };
+
+    const hasFreshMonitorSession = (): boolean => {
+      const session = liveMonitorSessionRef.current;
+      if (!session) {
+        return false;
+      }
+      return session.expiresAtMs - Date.now() > 15_000;
+    };
+
+    const createMonitorSession = async (): Promise<string> => {
+      const headers = await getAuthHeaders();
+      const response = await fetch("/api/clawnow/instances/live-monitor/session", {
+        method: "POST",
+        headers,
+        cache: "no-store",
+      });
+      const data = await parseApiResponse<{
+        gatewayWebSocketUrl: string;
+        expiresAt: string;
+      }>(response);
+      const expiresAtMs = new Date(data.expiresAt).getTime();
+      liveMonitorSessionRef.current = {
+        gatewayWebSocketUrl: data.gatewayWebSocketUrl,
+        expiresAtMs: Number.isFinite(expiresAtMs) ? expiresAtMs : Date.now() + 240_000,
+      };
+      return data.gatewayWebSocketUrl;
+    };
+
+    const resolveMonitorSessionUrl = async (): Promise<string> => {
+      if (hasFreshMonitorSession()) {
+        return liveMonitorSessionRef.current!.gatewayWebSocketUrl;
+      }
+      return await createMonitorSession();
+    };
+
+    const isRecoverableMonitorError = (err: unknown): boolean => {
+      if (!(err instanceof ApiError)) {
+        return false;
+      }
+      return (
+        err.code === "GATEWAY_REQUEST_FAILED" ||
+        err.code === "GATEWAY_CONNECT_FAILED" ||
+        err.code === "GATEWAY_TIMEOUT" ||
+        err.code === "GATEWAY_SOCKET_CLOSED" ||
+        err.code === "GATEWAY_SESSION_MISMATCH"
+      );
+    };
+
+    const pollMonitor = async () => {
+      try {
+        const gatewayWebSocketUrl = await resolveMonitorSessionUrl();
+        const headers = await getAuthHeaders();
+        const response = await fetch("/api/clawnow/instances/live-monitor/activity", {
+          method: "POST",
+          headers: {
+            ...headers,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ gatewayWebSocketUrl }),
+          cache: "no-store",
+        });
+        const data = await parseApiResponse<{ active: boolean }>(response);
+        if (cancelled) {
+          return;
+        }
+        setBrowserLiveState(Boolean(data.active));
+      } catch (err: unknown) {
+        if (cancelled) {
+          return;
+        }
+        setBrowserLiveState(false);
+        if (isRecoverableMonitorError(err)) {
+          liveMonitorSessionRef.current = null;
+        }
+      } finally {
+        if (!cancelled) {
+          timer = setTimeout(() => {
+            void pollMonitor();
+          }, LIVE_MONITOR_POLL_INTERVAL_MS);
+        }
+      }
+    };
+
+    void pollMonitor();
+
+    return () => {
+      cancelled = true;
+      if (timer) {
+        clearTimeout(timer);
+      }
+      if (liveIndicatorHoldTimerRef.current) {
+        clearTimeout(liveIndicatorHoldTimerRef.current);
+        liveIndicatorHoldTimerRef.current = null;
+      }
+      setBrowserTaskLiveActive(false);
+      liveMonitorSessionRef.current = null;
+    };
+  }, [canOpenSession, desktopLiveActive, getAuthHeaders, onboardingCompleted]);
+
   const bootingWarnings = useMemo(() => {
     const normalize = (value: string) => value.trim().toLowerCase().replace(/\s+/g, " ");
     const notices: string[] = [];
@@ -1285,11 +1599,19 @@ export default function ClawNowPage() {
                     Your dedicated cloud workspace is ready when status turns Ready.
                   </p>
                 </div>
-                <span
-                  className={`rounded-full border px-3 py-1 text-xs font-medium ${getStatusClass(instance?.status)}`}
-                >
-                  {getStatusLabel(instance?.status)}
-                </span>
+                <div className="flex flex-wrap items-center gap-2">
+                  {desktopLiveActive && browserTaskLiveActive && (
+                    <span className="inline-flex items-center gap-2 rounded-full border border-[#F6CACA] bg-[#FFF6F6] px-3 py-1 text-xs font-semibold text-[#B3261E]">
+                      <span className="h-2 w-2 animate-pulse rounded-full bg-[#B3261E]" />
+                      LIVE
+                    </span>
+                  )}
+                  <span
+                    className={`rounded-full border px-3 py-1 text-xs font-medium ${getStatusClass(instance?.status)}`}
+                  >
+                    {getStatusLabel(instance?.status)}
+                  </span>
+                </div>
               </div>
 
               {error && (
@@ -1333,6 +1655,32 @@ export default function ClawNowPage() {
                       {canLaunchGateway ? "Launch Gateway" : "Complete Setup Wizard First"}
                     </button>
 
+                    {canOpenSession && (
+                      <button
+                        onClick={handleOpenDesktopLive}
+                        disabled={openingDesktopLive}
+                        className="inline-flex items-center gap-2 rounded-full border border-[#DCDCDC] bg-white px-5 py-2.5 text-sm font-semibold text-[#111] transition hover:bg-[#F6F6F6] disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {openingDesktopLive ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Monitor className="h-4 w-4" />
+                        )}
+                        {openingDesktopLive ? "Opening Desktop..." : "Open Desktop Live"}
+                      </button>
+                    )}
+
+                    {desktopLiveLaunchUrl && canOpenSession && (
+                      <button
+                        onClick={handleReopenDesktopLive}
+                        disabled={openingDesktopLive}
+                        className="inline-flex items-center gap-2 rounded-full border border-[#DCDCDC] bg-white px-5 py-2.5 text-sm font-semibold text-[#111] transition hover:bg-[#F6F6F6] disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        <ExternalLink className="h-4 w-4" />
+                        Re-open Desktop Live
+                      </button>
+                    )}
+
                     {onboardingCompleted && canOpenSession && (
                       <button
                         onClick={() => {
@@ -1346,9 +1694,46 @@ export default function ClawNowPage() {
                         Re-setup Wizard
                       </button>
                     )}
+
+                    {canOpenSession && (
+                      <button
+                        onClick={handleRepairGatewayDefaults}
+                        disabled={repairingGatewayDefaults || openingControlUi}
+                        className="inline-flex items-center justify-center gap-2 rounded-full border border-[#DCDCDC] bg-white px-5 py-2.5 text-sm font-semibold text-[#111] transition hover:bg-[#F6F6F6] disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {repairingGatewayDefaults ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Wrench className="h-4 w-4" />
+                        )}
+                        {repairingGatewayDefaults ? "Repairing..." : "Fix Channels & Browser"}
+                      </button>
+                    )}
                   </>
                 )}
               </div>
+
+              {canOpenSession && (
+                <div className="mt-4 rounded-2xl border border-[#EFEFEF] bg-[#FAFAFA] px-4 py-3 text-sm text-[#555]">
+                  {desktopLiveActive && browserTaskLiveActive ? (
+                    <p>
+                      Browser task is running
+                      {desktopLiveExpiresLabel ? ` (expires around ${desktopLiveExpiresLabel})` : ""}
+                      . Keep the Desktop Live tab open while agent runs browser tasks.
+                    </p>
+                  ) : desktopLiveActive ? (
+                    <p>
+                      Desktop Live connected. LIVE lights up only while the agent is actively using
+                      the browser (with a short anti-flicker delay).
+                    </p>
+                  ) : (
+                    <p>
+                      Tip: click <strong>Open Desktop Live</strong> to watch browser automation in
+                      real time while the agent works.
+                    </p>
+                  )}
+                </div>
+              )}
 
               <div className="mt-5 flex flex-wrap gap-2">
                 <button

@@ -155,6 +155,13 @@ const GATEWAY_HEALTH_PATH = "__clawnow/health";
 const GATEWAY_REPAIR_PATH = "__clawnow/repair/gateway";
 const LEGACY_HTTP_GATEWAY_REASON = "legacy_http_gateway_detected";
 const CLAWNOW_CLOUD_INIT_MAX_BYTES = 16000;
+const LIVE_MONITOR_CHAT_HISTORY_LIMIT = 320;
+const OPENAI_PROVIDER_DEFAULT_BASE_URL = "https://api.openai.com/v1";
+const OPENAI_CODEX_PROVIDER_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api";
+const OPENAI_DEFAULT_MODEL = "openai/gpt-5.1-codex";
+const OPENAI_CODEX_DEFAULT_MODEL = "openai-codex/gpt-5.3-codex";
+const CLAWNOW_DEFAULT_CHANNEL_IDS = ["telegram", "whatsapp"] as const;
+const DEFAULT_MAIN_SESSION_KEY = "main";
 const DEFAULT_BOOTSTRAP_SCRIPT_URL =
   "https://raw.githubusercontent.com/openclaw/openclaw/main/scripts/clawnow-vm-bootstrap.sh";
 const DEFAULT_PROXY_SCRIPT_URL =
@@ -319,6 +326,181 @@ function safeErrorMessage(error: unknown): string {
     return error.message;
   }
   return "Unknown error";
+}
+
+function asObjectRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function normalizeToolNameForLiveMonitor(raw: unknown): string | null {
+  if (typeof raw !== "string") {
+    return null;
+  }
+  const normalized = raw.trim().toLowerCase();
+  return normalized || null;
+}
+
+function isBrowserToolNameForLiveMonitor(raw: unknown): boolean {
+  const normalized = normalizeToolNameForLiveMonitor(raw);
+  if (!normalized) {
+    return false;
+  }
+  return (
+    normalized === "browser" ||
+    normalized.startsWith("browser.") ||
+    normalized.startsWith("browser_")
+  );
+}
+
+function readToolCallIdForLiveMonitor(value: unknown): string | null {
+  const record = asObjectRecord(value);
+  if (!record) {
+    return null;
+  }
+  const raw =
+    record.toolCallId ??
+    record.tool_call_id ??
+    record.call_id ??
+    record.callId ??
+    record.id ??
+    null;
+  if (typeof raw !== "string") {
+    return null;
+  }
+  const normalized = raw.trim();
+  return normalized || null;
+}
+
+function readToolNameForLiveMonitor(value: unknown): string | null {
+  const record = asObjectRecord(value);
+  if (!record) {
+    return null;
+  }
+  const direct = normalizeToolNameForLiveMonitor(
+    record.name ?? record.toolName ?? record.tool_name ?? null,
+  );
+  if (direct) {
+    return direct;
+  }
+  const fn = asObjectRecord(record.function);
+  if (!fn) {
+    return null;
+  }
+  return normalizeToolNameForLiveMonitor(fn.name ?? null);
+}
+
+function extractBrowserToolCallStartsForLiveMonitor(message: unknown): string[] {
+  const record = asObjectRecord(message);
+  if (!record) {
+    return [];
+  }
+  const ids = new Set<string>();
+
+  const topLevelToolCalls = Array.isArray(record.tool_calls) ? record.tool_calls : [];
+  for (const call of topLevelToolCalls) {
+    const callId = readToolCallIdForLiveMonitor(call);
+    const toolName = readToolNameForLiveMonitor(call);
+    if (callId && isBrowserToolNameForLiveMonitor(toolName)) {
+      ids.add(callId);
+    }
+  }
+
+  const content = Array.isArray(record.content) ? record.content : [];
+  for (const block of content) {
+    const callId = readToolCallIdForLiveMonitor(block);
+    const toolName = readToolNameForLiveMonitor(block);
+    if (!callId || !isBrowserToolNameForLiveMonitor(toolName)) {
+      continue;
+    }
+    const blockRecord = asObjectRecord(block);
+    const typeRaw = blockRecord?.type;
+    const type = typeof typeRaw === "string" ? typeRaw.trim().toLowerCase() : "";
+    const looksLikeToolCall =
+      type === "tooluse" ||
+      type === "tool_use" ||
+      type === "tool-call" ||
+      type === "toolcall" ||
+      type === "function_call" ||
+      type === "functioncall" ||
+      type === "";
+    if (looksLikeToolCall) {
+      ids.add(callId);
+    }
+  }
+
+  return [...ids];
+}
+
+function extractToolCallResultIdsForLiveMonitor(message: unknown): string[] {
+  const record = asObjectRecord(message);
+  if (!record) {
+    return [];
+  }
+  const ids = new Set<string>();
+
+  const directId = readToolCallIdForLiveMonitor(record);
+  const roleRaw = record.role;
+  const role = typeof roleRaw === "string" ? roleRaw.trim().toLowerCase() : "";
+  if (directId && (role === "tool" || role === "toolresult" || role === "tool_result")) {
+    ids.add(directId);
+  }
+
+  const content = Array.isArray(record.content) ? record.content : [];
+  for (const block of content) {
+    const blockRecord = asObjectRecord(block);
+    if (!blockRecord) {
+      continue;
+    }
+    const typeRaw = blockRecord.type;
+    const type = typeof typeRaw === "string" ? typeRaw.trim().toLowerCase() : "";
+    if (
+      type === "toolresult" ||
+      type === "tool_result" ||
+      type === "function_call_output" ||
+      type === "functioncalloutput"
+    ) {
+      const id = readToolCallIdForLiveMonitor(blockRecord);
+      if (id) {
+        ids.add(id);
+      }
+    }
+  }
+
+  if (directId && ids.size === 0 && role === "tool") {
+    ids.add(directId);
+  }
+
+  return [...ids];
+}
+
+function hasRunningBrowserToolCallInHistory(messages: unknown[]): boolean {
+  const browserToolCalls = new Set<string>();
+
+  for (const message of messages) {
+    const starts = extractBrowserToolCallStartsForLiveMonitor(message);
+    for (const callId of starts) {
+      browserToolCalls.add(callId);
+    }
+
+    const results = extractToolCallResultIdsForLiveMonitor(message);
+    for (const callId of results) {
+      browserToolCalls.delete(callId);
+    }
+  }
+
+  return browserToolCalls.size > 0;
+}
+
+function asTrimmedStringArray(value: unknown): string[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  return value
+    .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+    .filter(Boolean);
 }
 
 function isAbortError(error: unknown): boolean {
@@ -844,6 +1026,115 @@ export class ClawNowService {
     };
   }
 
+  async createLiveMonitorSession(
+    userId: string,
+    requestMeta?: ClawNowRequestMeta,
+  ): Promise<{
+    instance: ClawInstance;
+    gatewayWebSocketUrl: string;
+    expiresAt: string;
+  }> {
+    const health = await this.getInstanceHealth(userId, { syncProvider: true });
+    if (!health.instance) {
+      throw new ClawNowServiceError("INSTANCE_NOT_FOUND", "No VM exists for this user yet", 404);
+    }
+    if (health.instance.status !== "running") {
+      throw new ClawNowServiceError(
+        "INSTANCE_NOT_RUNNING",
+        "VM is not running. Please recover first.",
+        409,
+      );
+    }
+    if (!this.isTerminalOnboardingCompleted(health.instance)) {
+      throw new ClawNowServiceError(
+        "ONBOARDING_REQUIRED",
+        "Complete terminal onboarding before opening live monitor.",
+        409,
+      );
+    }
+
+    const session = await this.createControlGatewaySession(health.instance, userId, requestMeta, {
+      syncControlUiOrigins: true,
+      strictControlUiOriginSync: false,
+    });
+
+    await this.logEvent(
+      health.instance.id,
+      userId,
+      "session.live_monitor",
+      "Desktop live monitor session created",
+      {
+        expiresAt: session.expiresAt,
+        ip: requestMeta?.ip || null,
+      },
+    );
+
+    return {
+      instance: health.instance,
+      gatewayWebSocketUrl: session.gatewayWebSocketUrl,
+      expiresAt: session.expiresAt,
+    };
+  }
+
+  async getLiveMonitorActivity(
+    userId: string,
+    params: {
+      gatewayWebSocketUrl: string;
+    },
+  ): Promise<{
+    instance: ClawInstance;
+    active: boolean;
+    checkedAt: string;
+  }> {
+    const health = await this.getInstanceHealth(userId, { syncProvider: true });
+    if (!health.instance) {
+      throw new ClawNowServiceError("INSTANCE_NOT_FOUND", "No VM exists for this user yet", 404);
+    }
+    if (health.instance.status !== "running") {
+      throw new ClawNowServiceError(
+        "INSTANCE_NOT_RUNNING",
+        "VM is not running. Please recover first.",
+        409,
+      );
+    }
+    if (!this.isTerminalOnboardingCompleted(health.instance)) {
+      throw new ClawNowServiceError(
+        "ONBOARDING_REQUIRED",
+        "Complete terminal onboarding before checking live activity.",
+        409,
+      );
+    }
+
+    const session = this.parseLiveMonitorGatewaySession(params.gatewayWebSocketUrl);
+    if (session.instanceId !== health.instance.id) {
+      throw new ClawNowServiceError(
+        "GATEWAY_SESSION_MISMATCH",
+        "Live monitor session mismatch. Start Desktop Live again.",
+        409,
+      );
+    }
+
+    const historyPayload = (await this.withGatewayConnection(
+      session.gatewayWebSocketUrl,
+      session.token,
+      async (sendRequest) => {
+        return await sendRequest("chat.history", {
+          sessionKey: DEFAULT_MAIN_SESSION_KEY,
+          limit: LIVE_MONITOR_CHAT_HISTORY_LIMIT,
+        });
+      },
+      { timeoutMs: Math.max(5000, Math.floor(GATEWAY_WS_TIMEOUT_MS * 0.75)) },
+    )) as { messages?: unknown[] };
+
+    const messages = Array.isArray(historyPayload?.messages) ? historyPayload.messages : [];
+
+    return {
+      instance: health.instance,
+      active: hasRunningBrowserToolCallInHistory(messages),
+      checkedAt: new Date().toISOString(),
+    };
+  }
+
   async createNoVncSession(
     userId: string,
     requestMeta?: ClawNowRequestMeta,
@@ -877,11 +1168,13 @@ export class ClawNowService {
       novnc_enabled_until: session.expiresAt,
     });
 
-    const noVncBase = this.resolveLaunchBaseUrl(updated, "novnc");
+    const noVncBase = this.ensureNoVncViewerPath(this.resolveLaunchBaseUrl(updated, "novnc"));
     const launchUrl = this.withQuery(noVncBase, {
       instanceId: updated.id,
       token: session.token,
       mode: "trusted-proxy",
+      autoconnect: "1",
+      resize: "remote",
     });
 
     await this.logEvent(updated.id, userId, "session.novnc", "noVNC session created", {
@@ -918,30 +1211,23 @@ export class ClawNowService {
       );
     }
 
-    const session = await this.createAccessSession(
-      health.instance,
-      userId,
-      "control_ui",
-      this.config.controlSessionTtlSeconds,
-      requestMeta,
-    );
-
-    const controlUiBase = this.ensureTrailingSlash(
-      this.resolveLaunchBaseUrl(health.instance, "control_ui"),
-    );
-    const gatewayWebSocketUrl = this.withQuery(this.toWebSocketUrl(controlUiBase), {
-      instanceId: health.instance.id,
-      token: session.token,
-      mode: "trusted-proxy",
+    const session = await this.createControlGatewaySession(health.instance, userId, requestMeta, {
+      syncControlUiOrigins: true,
+      strictControlUiOriginSync: false,
     });
-    await this.patchGatewayConfig(gatewayWebSocketUrl, session.token, {
-      models: {
-        providers: {
-          openai: {
-            apiKey: normalizedApiKey,
-          },
-        },
-      },
+    await this.patchOpenAiProviderAndWorkspaceDefaults({
+      gatewayWebSocketUrl: session.gatewayWebSocketUrl,
+      token: session.token,
+      providerId: "openai",
+      apiKey: normalizedApiKey,
+      fallbackBaseUrl: OPENAI_PROVIDER_DEFAULT_BASE_URL,
+      modelRef: OPENAI_DEFAULT_MODEL,
+      alias: "GPT",
+    });
+    await this.patchGatewayMainSessionModel({
+      gatewayWebSocketUrl: session.gatewayWebSocketUrl,
+      token: session.token,
+      modelRef: OPENAI_DEFAULT_MODEL,
     });
 
     await this.logEvent(
@@ -984,30 +1270,23 @@ export class ClawNowService {
       );
     }
 
-    const session = await this.createAccessSession(
-      health.instance,
-      userId,
-      "control_ui",
-      this.config.controlSessionTtlSeconds,
-      requestMeta,
-    );
-
-    const controlUiBase = this.ensureTrailingSlash(
-      this.resolveLaunchBaseUrl(health.instance, "control_ui"),
-    );
-    const gatewayWebSocketUrl = this.withQuery(this.toWebSocketUrl(controlUiBase), {
-      instanceId: health.instance.id,
-      token: session.token,
-      mode: "trusted-proxy",
+    const session = await this.createControlGatewaySession(health.instance, userId, requestMeta, {
+      syncControlUiOrigins: true,
+      strictControlUiOriginSync: false,
     });
-    await this.patchGatewayConfig(gatewayWebSocketUrl, session.token, {
-      models: {
-        providers: {
-          "openai-codex": {
-            apiKey: normalizedAccessToken,
-          },
-        },
-      },
+    await this.patchOpenAiProviderAndWorkspaceDefaults({
+      gatewayWebSocketUrl: session.gatewayWebSocketUrl,
+      token: session.token,
+      providerId: "openai-codex",
+      apiKey: normalizedAccessToken,
+      fallbackBaseUrl: OPENAI_CODEX_PROVIDER_DEFAULT_BASE_URL,
+      modelRef: OPENAI_CODEX_DEFAULT_MODEL,
+      alias: "Codex",
+    });
+    await this.patchGatewayMainSessionModel({
+      gatewayWebSocketUrl: session.gatewayWebSocketUrl,
+      token: session.token,
+      modelRef: OPENAI_CODEX_DEFAULT_MODEL,
     });
 
     await this.logEvent(
@@ -1022,6 +1301,236 @@ export class ClawNowService {
     );
 
     return { instance: health.instance };
+  }
+
+  async repairGatewayDefaults(
+    userId: string,
+    requestMeta?: ClawNowRequestMeta,
+  ): Promise<{ instance: ClawInstance; changed: boolean }> {
+    const instance = await this.requireRunningInstance(userId);
+    const session = await this.createControlGatewaySession(instance, userId, requestMeta, {
+      syncControlUiOrigins: true,
+      strictControlUiOriginSync: false,
+    });
+    const changed = await this.applyClawNowGatewayDefaults({
+      gatewayWebSocketUrl: session.gatewayWebSocketUrl,
+      token: session.token,
+      force: true,
+    });
+
+    await this.logEvent(
+      instance.id,
+      userId,
+      "gateway.defaults.repair",
+      changed
+        ? "Repaired gateway defaults for browser/channel setup"
+        : "Gateway defaults already up to date",
+      {
+        changed,
+        ip: requestMeta?.ip || null,
+      },
+    );
+
+    return { instance, changed };
+  }
+
+  private async applyClawNowGatewayDefaults(params: {
+    gatewayWebSocketUrl: string;
+    token: string;
+    force: boolean;
+  }): Promise<boolean> {
+    const snapshot = await this.requestGatewayMethod<{ config?: unknown }>(
+      params.gatewayWebSocketUrl,
+      params.token,
+      "config.get",
+      {},
+    );
+    const patch = this.buildClawNowGatewayDefaultsPatch(snapshot?.config, params.force);
+    if (!patch) {
+      return false;
+    }
+    await this.patchGatewayConfig(params.gatewayWebSocketUrl, params.token, patch);
+    return true;
+  }
+
+  private buildClawNowGatewayDefaultsPatch(
+    configRaw: unknown,
+    force: boolean,
+  ): Record<string, unknown> | null {
+    const config = asObjectRecord(configRaw) ?? {};
+    const browser = asObjectRecord(config.browser);
+    const web = asObjectRecord(config.web);
+    const channels = asObjectRecord(config.channels);
+    const plugins = asObjectRecord(config.plugins);
+    const pluginEntries = asObjectRecord(plugins?.entries);
+
+    const patch: Record<string, unknown> = {};
+
+    const browserPatch: Record<string, unknown> = {};
+    const browserEnabled = browser?.enabled;
+    if ((force && browserEnabled !== true) || (!force && browserEnabled === undefined)) {
+      browserPatch.enabled = true;
+    }
+    const browserDefaultProfile =
+      typeof browser?.defaultProfile === "string" ? browser.defaultProfile.trim() : "";
+    if ((force && browserDefaultProfile !== "openclaw") || (!force && !browserDefaultProfile)) {
+      browserPatch.defaultProfile = "openclaw";
+    }
+    if (Object.keys(browserPatch).length > 0) {
+      patch.browser = browserPatch;
+    }
+
+    const webEnabled = web?.enabled;
+    if ((force && webEnabled !== true) || (!force && webEnabled === undefined)) {
+      patch.web = { enabled: true };
+    }
+
+    const channelsPatch: Record<string, unknown> = {};
+    const pluginEntriesPatch: Record<string, unknown> = {};
+    for (const channelId of CLAWNOW_DEFAULT_CHANNEL_IDS) {
+      const channelConfig = asObjectRecord(channels?.[channelId]);
+      const channelEnabled = channelConfig?.enabled;
+      if ((force && channelEnabled !== true) || (!force && channelEnabled === undefined)) {
+        channelsPatch[channelId] = { enabled: true };
+      }
+
+      const pluginEntry = asObjectRecord(pluginEntries?.[channelId]);
+      const pluginEnabled = pluginEntry?.enabled;
+      if ((force && pluginEnabled !== true) || (!force && pluginEnabled === undefined)) {
+        pluginEntriesPatch[channelId] = { enabled: true };
+      }
+    }
+    if (Object.keys(channelsPatch).length > 0) {
+      patch.channels = channelsPatch;
+    }
+
+    const pluginsPatch: Record<string, unknown> = {};
+    if (Object.keys(pluginEntriesPatch).length > 0) {
+      pluginsPatch.entries = pluginEntriesPatch;
+    }
+
+    const allow = asTrimmedStringArray(plugins?.allow);
+    if (allow && allow.length > 0) {
+      const missingAllow = CLAWNOW_DEFAULT_CHANNEL_IDS.filter((id) => !allow.includes(id));
+      if (missingAllow.length > 0) {
+        pluginsPatch.allow = [...allow, ...missingAllow];
+      }
+    }
+
+    if (force) {
+      const deny = asTrimmedStringArray(plugins?.deny);
+      if (deny) {
+        const managedChannelSet = new Set<string>(CLAWNOW_DEFAULT_CHANNEL_IDS);
+        const nextDeny = deny.filter((entry) => !managedChannelSet.has(entry));
+        if (nextDeny.length !== deny.length) {
+          pluginsPatch.deny = nextDeny;
+        }
+      }
+    }
+
+    if (Object.keys(pluginsPatch).length > 0) {
+      patch.plugins = pluginsPatch;
+    }
+
+    return Object.keys(patch).length > 0 ? patch : null;
+  }
+
+  private async patchOpenAiProviderAndWorkspaceDefaults(params: {
+    gatewayWebSocketUrl: string;
+    token: string;
+    providerId: string;
+    apiKey: string;
+    fallbackBaseUrl: string;
+    modelRef: string;
+    alias: string;
+  }): Promise<void> {
+    const modelRef = params.modelRef.trim();
+    if (!modelRef) {
+      return;
+    }
+
+    const snapshot = await this.requestGatewayMethod<{
+      config?: unknown;
+    }>(params.gatewayWebSocketUrl, params.token, "config.get", {});
+
+    const config = asObjectRecord(snapshot?.config);
+    const modelsConfig = asObjectRecord(config?.models);
+    const providersRaw = modelsConfig?.providers;
+    const providers =
+      providersRaw && typeof providersRaw === "object" && !Array.isArray(providersRaw)
+        ? (providersRaw as Record<string, unknown>)
+        : {};
+    const existingProviderRaw = providers[params.providerId];
+    const existingProvider =
+      existingProviderRaw &&
+      typeof existingProviderRaw === "object" &&
+      !Array.isArray(existingProviderRaw)
+        ? (existingProviderRaw as { baseUrl?: unknown; models?: unknown })
+        : {};
+
+    const existingBaseUrl =
+      typeof existingProvider.baseUrl === "string" ? existingProvider.baseUrl.trim() : "";
+    const hasModelsArray = Array.isArray(existingProvider.models);
+
+    const providerPatch: Record<string, unknown> = {
+      apiKey: params.apiKey,
+    };
+    if (!existingBaseUrl) {
+      providerPatch.baseUrl = params.fallbackBaseUrl;
+    }
+    if (!hasModelsArray) {
+      // Keep provider config schema-valid without replacing catalog models.
+      providerPatch.models = [];
+    }
+
+    const defaultsPatch = this.buildClawNowGatewayDefaultsPatch(snapshot?.config, false);
+    const mergedPatch: Record<string, unknown> = {
+      ...(defaultsPatch || {}),
+      models: {
+        providers: {
+          [params.providerId]: providerPatch,
+        },
+      },
+      agents: {
+        defaults: {
+          model: {
+            primary: modelRef,
+          },
+          models: {
+            [modelRef]: {
+              alias: params.alias,
+            },
+          },
+        },
+      },
+    };
+
+    await this.patchGatewayConfig(params.gatewayWebSocketUrl, params.token, mergedPatch);
+  }
+
+  private async patchGatewayMainSessionModel(params: {
+    gatewayWebSocketUrl: string;
+    token: string;
+    modelRef: string;
+  }): Promise<void> {
+    const modelRef = params.modelRef.trim();
+    if (!modelRef) {
+      return;
+    }
+
+    try {
+      await this.requestGatewayMethod(
+        params.gatewayWebSocketUrl,
+        params.token,
+        "sessions.patch",
+        {
+          key: DEFAULT_MAIN_SESSION_KEY,
+          model: modelRef,
+        },
+      );
+    } catch {
+      // Best-effort: keep auth setup successful even if main session wasn't created yet.
+    }
   }
 
   async startTerminalOnboarding(
@@ -1460,7 +1969,7 @@ export class ClawNowService {
       ? joinUrl(gatewayUrl, this.config.controlUiPath)
       : this.buildSharedControlUiUrl(instanceId);
     const novncUrl = gatewayUrl
-      ? joinUrl(gatewayUrl, this.config.novncPath)
+      ? this.ensureNoVncViewerPath(joinUrl(gatewayUrl, this.config.novncPath))
       : this.buildSharedNoVncUrl(instanceId);
 
     const patch: Record<string, unknown> = {
@@ -1757,7 +2266,22 @@ export class ClawNowService {
     if (!this.config.novncBaseUrl) {
       return null;
     }
-    return this.withQuery(this.config.novncBaseUrl, { instanceId });
+    return this.withQuery(this.ensureNoVncViewerPath(this.config.novncBaseUrl), { instanceId });
+  }
+
+  private ensureNoVncViewerPath(baseUrl: string): string {
+    const url = new URL(baseUrl);
+    const normalizedPath = url.pathname.toLowerCase();
+    if (
+      normalizedPath.endsWith("/vnc.html") ||
+      normalizedPath.endsWith("/vnc_lite.html") ||
+      normalizedPath.endsWith("/vnc_auto.html")
+    ) {
+      return url.toString();
+    }
+    const trimmedPath = url.pathname.replace(/\/+$/, "");
+    url.pathname = `${trimmedPath || ""}/vnc.html`;
+    return url.toString();
   }
 
   private buildInstanceGatewayUrl(params: {
@@ -1880,6 +2404,64 @@ export class ClawNowService {
       token: session.token,
       expiresAt: session.expiresAt,
       gatewayWebSocketUrl,
+    };
+  }
+
+  private parseLiveMonitorGatewaySession(rawGatewayWebSocketUrl: string): {
+    gatewayWebSocketUrl: string;
+    instanceId: string;
+    token: string;
+  } {
+    const raw = rawGatewayWebSocketUrl.trim();
+    if (!raw) {
+      throw new ClawNowServiceError(
+        "BAD_REQUEST",
+        "gatewayWebSocketUrl is required for live monitor activity.",
+        400,
+      );
+    }
+
+    let parsed: URL;
+    try {
+      parsed = new URL(raw);
+    } catch {
+      throw new ClawNowServiceError(
+        "BAD_REQUEST",
+        "gatewayWebSocketUrl must be a valid websocket URL.",
+        400,
+      );
+    }
+
+    if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
+      throw new ClawNowServiceError(
+        "BAD_REQUEST",
+        "gatewayWebSocketUrl must use ws:// or wss:// protocol.",
+        400,
+      );
+    }
+
+    const instanceId = parsed.searchParams.get("instanceId")?.trim() || "";
+    if (!instanceId) {
+      throw new ClawNowServiceError(
+        "BAD_REQUEST",
+        "gatewayWebSocketUrl is missing instanceId.",
+        400,
+      );
+    }
+
+    const token = parsed.searchParams.get("token")?.trim() || "";
+    if (!token) {
+      throw new ClawNowServiceError(
+        "BAD_REQUEST",
+        "gatewayWebSocketUrl is missing gateway auth token.",
+        400,
+      );
+    }
+
+    return {
+      gatewayWebSocketUrl: parsed.toString(),
+      instanceId,
+      token,
     };
   }
 
@@ -2481,6 +3063,51 @@ export class ClawNowService {
     return value.replace(new RegExp(`${esc}\\[[0-9;]*m`, "g"), "");
   }
 
+  private formatGatewayErrorMessage(
+    error:
+      | {
+          code?: string;
+          message?: string;
+          details?: unknown;
+        }
+      | null
+      | undefined,
+  ): string {
+    const base = (error?.message || error?.code || "Gateway request failed").trim();
+    const details = error?.details;
+    if (!details || typeof details !== "object") {
+      return base;
+    }
+
+    const issuesRaw = (details as { issues?: unknown }).issues;
+    if (!Array.isArray(issuesRaw)) {
+      return base;
+    }
+    const issues = issuesRaw
+      .map((issue) => {
+        if (!issue || typeof issue !== "object") {
+          return null;
+        }
+        const path =
+          typeof (issue as { path?: unknown }).path === "string"
+            ? (issue as { path: string }).path.trim()
+            : "";
+        const message =
+          typeof (issue as { message?: unknown }).message === "string"
+            ? (issue as { message: string }).message.trim()
+            : "";
+        if (!path && !message) {
+          return null;
+        }
+        return path ? `${path}: ${message || "invalid"}` : message;
+      })
+      .filter((line): line is string => Boolean(line));
+    if (issues.length === 0) {
+      return base;
+    }
+    return `${base} (${issues.join("; ")})`;
+  }
+
   private extractLikelyOpenAiOAuthUrl(line: string): string | null {
     const normalized = this.stripAnsi(line);
     const matches = normalized.match(/https?:\/\/[^\s"'<>]+/g);
@@ -2811,7 +3438,7 @@ export class ClawNowService {
       request.reject(
         new ClawNowServiceError(
           "GATEWAY_REQUEST_FAILED",
-          response.error?.message || response.error?.code || "Gateway request failed",
+          this.formatGatewayErrorMessage(response.error),
           502,
         ),
       );
