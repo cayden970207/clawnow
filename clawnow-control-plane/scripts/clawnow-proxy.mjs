@@ -226,10 +226,38 @@ function getCookieNameForSessionType(sessionType) {
   return `${COOKIE_PREFIX}${sessionType}`;
 }
 
+function normalizeExpectedSessionTypes(expectedSessionType) {
+  if (typeof expectedSessionType === "string" && expectedSessionType.trim()) {
+    return [expectedSessionType.trim()];
+  }
+  if (!Array.isArray(expectedSessionType)) {
+    return [];
+  }
+  const normalized = [];
+  for (const value of expectedSessionType) {
+    if (typeof value !== "string") {
+      continue;
+    }
+    const trimmed = value.trim();
+    if (!trimmed || normalized.includes(trimmed)) {
+      continue;
+    }
+    normalized.push(trimmed);
+  }
+  return normalized;
+}
+
 function getCookieToken(req, expectedSessionType) {
   const cookies = parseCookies(req.headers.cookie);
-  if (expectedSessionType) {
-    return cookies[getCookieNameForSessionType(expectedSessionType)] || null;
+  const expected = normalizeExpectedSessionTypes(expectedSessionType);
+  if (expected.length > 0) {
+    for (const sessionType of expected) {
+      const token = cookies[getCookieNameForSessionType(sessionType)];
+      if (token) {
+        return token;
+      }
+    }
+    return null;
   }
   return (
     cookies[getCookieNameForSessionType("control_ui")] ||
@@ -453,7 +481,10 @@ function enforceGatewayTrustedProxyConfig(config) {
   next.gateway = next.gateway || {};
   next.gateway.mode = next.gateway.mode || "local";
   next.gateway.auth = next.gateway.auth || {};
-  next.gateway.auth.mode = "trusted-proxy";
+  // Gateway binds to loopback and is only reachable through this proxy, so we
+  // keep gateway auth disabled to avoid CLI/doctor "unauthorized" issues when
+  // they connect locally without trusted-proxy headers.
+  next.gateway.auth.mode = "none";
   next.gateway.auth.trustedProxy = next.gateway.auth.trustedProxy || {};
   next.gateway.auth.trustedProxy.userHeader = "x-forwarded-user";
   next.gateway.auth.trustedProxy.requiredHeaders = [
@@ -470,10 +501,6 @@ function enforceGatewayTrustedProxyConfig(config) {
   next.gateway.controlUi = next.gateway.controlUi || {};
   next.gateway.controlUi.basePath = next.gateway.controlUi.basePath || config.controlPrefix;
   next.gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback = true;
-  // ClawNow onboarding writes config mid-wizard. Automatic reload can restart the gateway,
-  // wiping in-memory wizard sessions. Keep reload off and rely on explicit restarts.
-  next.gateway.reload = next.gateway.reload || {};
-  next.gateway.reload.mode = "off";
 
   fs.writeFileSync(configPath, `${JSON.stringify(next, null, 2)}\n`);
   return { configPath };
@@ -504,7 +531,7 @@ async function handleGatewayRepair(req, res, config) {
       res,
       500,
       "repair_config_failed",
-      `Failed to enforce trusted-proxy config: ${String(error?.message || error)}`,
+      `Failed to enforce gateway config: ${String(error?.message || error)}`,
     );
     return;
   }
@@ -587,8 +614,11 @@ function buildTargetPath(route, requestUrl) {
     throw new Error("instance_mismatch");
   }
 
-  const expectedSessionType = route.expectedSessionType;
-  if (expectedSessionType && route.claims.sessionType !== expectedSessionType) {
+  const expectedSessionTypes = normalizeExpectedSessionTypes(route.expectedSessionType);
+  if (
+    expectedSessionTypes.length > 0 &&
+    !expectedSessionTypes.includes(route.claims.sessionType)
+  ) {
     throw new Error("session_type_mismatch");
   }
 
@@ -623,9 +653,7 @@ function createProxyConfig() {
     stripNoVncPrefix: parseBoolean(process.env.CLAWNOW_PROXY_STRIP_NOVNC_PREFIX, true),
     openclawUpstream: parseUpstream("CLAWNOW_OPENCLAW_UPSTREAM", "http://127.0.0.1:18789"),
     openclawService: process.env.CLAWNOW_OPENCLAW_SERVICE?.trim() || "openclaw-gateway.service",
-    novncUpstream: process.env.CLAWNOW_NOVNC_UPSTREAM?.trim()
-      ? parseUpstream("CLAWNOW_NOVNC_UPSTREAM", "http://127.0.0.1:6080")
-      : null,
+    novncUpstream: parseUpstream("CLAWNOW_NOVNC_UPSTREAM", "http://127.0.0.1:6080"),
   };
 }
 
@@ -647,7 +675,8 @@ function resolveRoute(config, pathname) {
       kind: "proxy",
       prefix: config.novncPrefix,
       stripPrefix: config.stripNoVncPrefix,
-      expectedSessionType: "novnc",
+      // Allow gateway control-ui sessions to open noVNC directly from the dashboard.
+      expectedSessionType: ["novnc", "control_ui"],
       upstream: config.novncUpstream,
     };
   }
