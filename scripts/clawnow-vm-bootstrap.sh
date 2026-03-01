@@ -64,6 +64,10 @@ CONTROL_PLANE_DEVICE_PUBLIC_KEY=""
 BOOTSTRAP_LOG="/var/log/clawnow-bootstrap.log"
 STATE_DIR="/var/lib/clawnow"
 STATE_FILE="${STATE_DIR}/bootstrap-state.json"
+DESKTOP_DISPLAY=":1"
+DESKTOP_VNC_PORT="5900"
+DESKTOP_NOVNC_PORT="6080"
+DESKTOP_NOVNC_WEB_ROOT="/usr/share/novnc"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -200,7 +204,7 @@ on_error() {
   write_state "failed" "error" "bootstrap failed at line ${line} (exit ${exit_code})"
   log_step "FAILED at line ${line} (exit ${exit_code})"
 
-  for unit in openclaw-gateway.service clawnow-proxy.service caddy.service; do
+  for unit in clawnow-desktop.service openclaw-gateway.service clawnow-proxy.service caddy.service; do
     if systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -qx "$unit"; then
       log_step "systemctl status ${unit}"
       systemctl --no-pager --full status "$unit" || true
@@ -315,6 +319,288 @@ install_caddy() {
   apt-get install -y caddy
 }
 
+has_supported_browser() {
+  command -v google-chrome >/dev/null 2>&1 || \
+    command -v google-chrome-stable >/dev/null 2>&1 || \
+    command -v chromium >/dev/null 2>&1 || \
+    command -v chromium-browser >/dev/null 2>&1
+}
+
+install_browser() {
+  if has_supported_browser; then
+    log_step "browser already installed"
+    return 0
+  fi
+
+  local arch
+  arch="$(dpkg --print-architecture 2>/dev/null || true)"
+  if [[ "$arch" == "amd64" ]]; then
+    local chrome_deb="/tmp/google-chrome-stable_current_amd64.deb"
+    log_step "attempting to install google-chrome-stable"
+    if curl --connect-timeout 10 --max-time 180 --retry 2 --retry-delay 2 -fsSL \
+      "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb" \
+      -o "$chrome_deb"; then
+      if ! dpkg -i "$chrome_deb"; then
+        apt-get install -f -y
+        dpkg -i "$chrome_deb"
+      fi
+      rm -f "$chrome_deb"
+    else
+      log_step "google-chrome download failed; falling back to distro chromium packages"
+      rm -f "$chrome_deb"
+    fi
+  fi
+
+  if has_supported_browser; then
+    return 0
+  fi
+
+  log_step "google-chrome unavailable; trying distro chromium packages"
+  apt-get install -y chromium || apt-get install -y chromium-browser
+
+  if ! has_supported_browser; then
+    echo "No supported browser was installed (tried google-chrome/chromium)." >&2
+    exit 1
+  fi
+}
+
+install_desktop_runtime_packages() {
+  if apt-get install -y xvfb x11vnc novnc websockify; then
+    return 0
+  fi
+  apt-get install -y xvfb x11vnc novnc python3-websockify
+}
+
+prepare_novnc_web_root() {
+  local source_root="/usr/share/novnc"
+  local target_root="/opt/clawnow/novnc"
+  local error_handler_path="${target_root}/app/error-handler.js"
+  local filter_script_path="${target_root}/clawnow-error-filter.js"
+  DESKTOP_NOVNC_WEB_ROOT="$source_root"
+
+  if [[ ! -d "$source_root" ]]; then
+    log_step "warning: noVNC source root not found (${source_root}); skipping extension error filter patch"
+    return 0
+  fi
+
+  rm -rf "$target_root"
+  if ! cp -a "$source_root" "$target_root"; then
+    log_step "warning: failed to clone noVNC web root into ${target_root}; using distro root"
+    return 0
+  fi
+  DESKTOP_NOVNC_WEB_ROOT="$target_root"
+
+  if [[ ! -f "$error_handler_path" ]]; then
+    log_step "warning: noVNC error handler missing at ${error_handler_path}; continuing without extension filter patch"
+    return 0
+  fi
+
+  cat >"$filter_script_path" <<'EOF_FILTER_JS'
+(() => {
+  if (typeof window === "undefined") {
+    return;
+  }
+  if (window.__CLAWNOW_NOVNC_ERROR_FILTER === true) {
+    return;
+  }
+  window.__CLAWNOW_NOVNC_ERROR_FILTER = true;
+
+  const knownMessage = (value) => {
+    const message = String(value ?? "").trim();
+    if (!message) {
+      return false;
+    }
+    return (
+      /Cannot redefine property:\s*(ethereum|solana)/i.test(message) ||
+      /Cannot assign to read only property\s+['"]?(ethereum|solana)['"]?/i.test(message) ||
+      /Cannot set property\s+['"]?(chainId|ethereum|solana)['"]?.*only a getter/i.test(message)
+    );
+  };
+
+  const isExtensionLocation = (value) =>
+    /(chrome|moz)-extension:\/\/|safari-web-extension:\/\//i.test(String(value ?? ""));
+
+  window.addEventListener(
+    "error",
+    (event) => {
+      const message = String(event?.message ?? event?.error?.message ?? "").trim();
+      const stack = String(event?.error?.stack ?? "");
+      const filename = String(event?.filename ?? "");
+      const locationHint = `${filename} ${stack}`;
+      if (!knownMessage(message) || !isExtensionLocation(locationHint)) {
+        return;
+      }
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    },
+    true,
+  );
+
+  window.addEventListener(
+    "unhandledrejection",
+    (event) => {
+      const reason = event?.reason;
+      const message = String(reason?.message ?? reason ?? "").trim();
+      const stack = String(reason?.stack ?? "");
+      if (!knownMessage(message) || !isExtensionLocation(stack)) {
+        return;
+      }
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    },
+    true,
+  );
+})();
+EOF_FILTER_JS
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$target_root" <<'PY'
+import pathlib
+import re
+import sys
+
+root = pathlib.Path(sys.argv[1])
+script_tag = '<script src="clawnow-error-filter.js"></script>'
+for name in ("vnc.html", "vnc_lite.html", "vnc_auto.html"):
+    html_path = root / name
+    if not html_path.exists():
+        continue
+    source = html_path.read_text(encoding="utf-8")
+    if "clawnow-error-filter.js" in source:
+        continue
+    if "</head>" in source:
+        updated = source.replace("</head>", f"  {script_tag}\n</head>", 1)
+    else:
+        updated = re.sub(
+            r"(<script[^>]+src=\"(?:app/ui\.js|app/ui-lite\.js|app/ui-auto\.js)\"[^>]*>)",
+            script_tag + "\n\\1",
+            source,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+    html_path.write_text(updated, encoding="utf-8")
+PY
+  else
+    log_step "warning: python3 missing; noVNC HTML prefilter injection skipped"
+  fi
+
+  if ! node - "$error_handler_path" <<'NODE'
+const fs = require("node:fs");
+
+const filePath = process.argv[2];
+let source = fs.readFileSync(filePath, "utf8");
+if (source.includes("CLAWNOW_EXTENSION_ERROR_FILTER")) {
+  process.exit(0);
+}
+
+const marker = "function handleError(event, err) {";
+if (!source.includes(marker)) {
+  throw new Error("noVNC error handler marker not found");
+}
+
+const injectedGuard = `function shouldIgnoreKnownExtensionInjectionErrors(event, err) {
+    const message = String(event?.message ?? err?.message ?? "").trim();
+    if (!message) {
+        return false;
+    }
+    const knownMessage =
+        /Cannot redefine property:\\s*(ethereum|solana)/i.test(message) ||
+        /Cannot assign to read only property\\s+['"]?(ethereum|solana)['"]?/i.test(message) ||
+        /Cannot set property\\s+['"]?(chainId|ethereum|solana)['"]?.*only a getter/i.test(message);
+    if (!knownMessage) {
+        return false;
+    }
+
+    const locationHint = [
+        typeof event?.filename === "string" ? event.filename : "",
+        typeof err?.stack === "string" ? err.stack : "",
+    ]
+        .filter(Boolean)
+        .join(" ");
+
+    return /(chrome|moz)-extension:\\/\\//i.test(locationHint);
+}
+
+// CLAWNOW_EXTENSION_ERROR_FILTER
+`;
+
+source = source.replace(marker, `${injectedGuard}${marker}`);
+source = source.replace(
+  "function handleError(event, err) {\n",
+  `function handleError(event, err) {\n    if (shouldIgnoreKnownExtensionInjectionErrors(event, err)) {\n        return false;\n    }\n`,
+);
+
+fs.writeFileSync(filePath, source);
+NODE
+  then
+    log_step "warning: failed to patch noVNC error handler; continuing with unpatched noVNC assets"
+  fi
+}
+
+install_desktop_runtime_files() {
+  cat >/opt/clawnow/clawnow-desktop-runtime.sh <<'EOF_DESKTOP_SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DISPLAY_NAME="${CLAWNOW_DESKTOP_DISPLAY:-:1}"
+DISPLAY_NUMBER="${DISPLAY_NAME#:}"
+SCREEN_SIZE="${CLAWNOW_DESKTOP_SCREEN:-1600x1000x24}"
+VNC_PORT="${CLAWNOW_DESKTOP_VNC_PORT:-5900}"
+NOVNC_PORT="${CLAWNOW_DESKTOP_NOVNC_PORT:-6080}"
+NOVNC_WEB_ROOT="${CLAWNOW_DESKTOP_NOVNC_WEB_ROOT:-/usr/share/novnc}"
+
+XVFB_PID=""
+X11VNC_PID=""
+WEBSOCKIFY_PID=""
+
+cleanup() {
+  for pid in "$WEBSOCKIFY_PID" "$X11VNC_PID" "$XVFB_PID"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
+      kill "$pid" >/dev/null 2>&1 || true
+    fi
+  done
+  wait >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+rm -f "/tmp/.X${DISPLAY_NUMBER}-lock"
+rm -f "/tmp/.X11-unix/X${DISPLAY_NUMBER}"
+install -d -m 0755 /tmp/.X11-unix
+
+Xvfb "$DISPLAY_NAME" -screen 0 "$SCREEN_SIZE" -ac -nolisten tcp &
+XVFB_PID="$!"
+
+for _ in $(seq 1 50); do
+  if [[ -S "/tmp/.X11-unix/X${DISPLAY_NUMBER}" ]]; then
+    break
+  fi
+  sleep 0.1
+done
+
+x11vnc -display "$DISPLAY_NAME" -rfbport "$VNC_PORT" -shared -forever -localhost -nopw &
+X11VNC_PID="$!"
+
+if command -v websockify >/dev/null 2>&1; then
+  websockify --web "${NOVNC_WEB_ROOT}/" "127.0.0.1:${NOVNC_PORT}" "127.0.0.1:${VNC_PORT}" &
+else
+  python3 -m websockify --web "${NOVNC_WEB_ROOT}/" "127.0.0.1:${NOVNC_PORT}" "127.0.0.1:${VNC_PORT}" &
+fi
+WEBSOCKIFY_PID="$!"
+
+wait -n "$XVFB_PID" "$X11VNC_PID" "$WEBSOCKIFY_PID"
+exit 1
+EOF_DESKTOP_SCRIPT
+  chmod +x /opt/clawnow/clawnow-desktop-runtime.sh
+
+  cat >/etc/clawnow-desktop.env <<EOF_DESKTOP_ENV
+CLAWNOW_DESKTOP_DISPLAY=${DESKTOP_DISPLAY}
+CLAWNOW_DESKTOP_VNC_PORT=${DESKTOP_VNC_PORT}
+CLAWNOW_DESKTOP_NOVNC_PORT=${DESKTOP_NOVNC_PORT}
+CLAWNOW_DESKTOP_SCREEN=1600x1000x24
+CLAWNOW_DESKTOP_NOVNC_WEB_ROOT=${DESKTOP_NOVNC_WEB_ROOT}
+EOF_DESKTOP_ENV
+}
+
 resolve_public_ipv4() {
   local ip
   ip="$(curl -4fsS --max-time 5 https://api.ipify.org || true)"
@@ -359,6 +645,10 @@ log_step "installing base packages"
 apt-get update
 apt-get install -y curl ca-certificates gnupg
 
+write_state "packages" "running" "installing desktop runtime packages"
+log_step "installing desktop runtime packages"
+install_desktop_runtime_packages
+
 if ! command -v node >/dev/null 2>&1 || ! node -v | grep -Eq '^v(22|23|24|25)\.'; then
   write_state "packages" "running" "installing Node.js 22"
   log_step "installing Node.js 22"
@@ -381,6 +671,10 @@ if [[ -z "$OPENCLAW_INSTALLED_VERSION" ]]; then
 fi
 log_step "resolved openclaw version: ${OPENCLAW_INSTALLED_VERSION}"
 
+write_state "packages" "running" "installing browser"
+log_step "ensuring a supported browser is installed"
+install_browser
+
 if [[ "$ENABLE_HTTPS" == "1" ]]; then
   write_state "packages" "running" "installing caddy"
   log_step "installing caddy"
@@ -392,6 +686,11 @@ log_step "installing proxy script from ${PROXY_SCRIPT_URL}"
 install -d -m 0755 /opt/clawnow
 curl -fsSL "$PROXY_SCRIPT_URL" -o /opt/clawnow/clawnow-proxy.mjs
 chmod +x /opt/clawnow/clawnow-proxy.mjs
+
+write_state "desktop_runtime" "running" "installing desktop runtime scripts"
+log_step "installing desktop runtime scripts"
+prepare_novnc_web_root
+install_desktop_runtime_files
 
 if [[ -n "$CONTROL_UI_MANIFEST_URL" ]]; then
   write_state "control_ui" "running" "updating control ui assets"
@@ -421,6 +720,7 @@ CLAWNOW_PROXY_SHARED_SECRET=${PROXY_SECRET}
 CLAWNOW_PROXY_BIND=${PROXY_BIND}
 CLAWNOW_PROXY_PORT=${PROXY_PORT}
 CLAWNOW_OPENCLAW_UPSTREAM=http://127.0.0.1:${GATEWAY_PORT}
+CLAWNOW_NOVNC_UPSTREAM=http://127.0.0.1:${DESKTOP_NOVNC_PORT}
 CLAWNOW_PROXY_CONTROL_PREFIX=${CONTROL_PREFIX}
 CLAWNOW_PROXY_NOVNC_PREFIX=${NOVNC_PREFIX}
 CLAWNOW_PROXY_EXPECTED_ISS=clawnow-control-plane
@@ -461,6 +761,7 @@ cat >/etc/openclaw-gateway.env <<EOF_GATEWAY_ENV
 OPENCLAW_VERSION=${OPENCLAW_INSTALLED_VERSION}
 OPENCLAW_SERVICE_VERSION=${OPENCLAW_INSTALLED_VERSION}
 OPENCLAW_MANAGED_TRUSTED_PROXY=1
+DISPLAY=${DESKTOP_DISPLAY}
 EOF_GATEWAY_ENV
 
 write_state "gateway_config" "running" "writing OpenClaw gateway config"
@@ -476,7 +777,9 @@ const fs = require('node:fs');
 
 const configPath = '/root/.openclaw/openclaw.json';
 const stateDir = '/root/.openclaw';
+const credentialsDir = '/root/.openclaw/credentials';
 fs.mkdirSync(stateDir, { recursive: true });
+fs.mkdirSync(credentialsDir, { recursive: true });
 
 let config = {};
 if (fs.existsSync(configPath)) {
@@ -492,20 +795,49 @@ config.gateway.mode = config.gateway.mode || 'local';
 // Disable automatic config reload/restart while running the onboarding wizard.
 // The wizard writes config multiple times; hot reload can restart the gateway mid-flow,
 // wiping the in-memory wizard session and forcing users to start over.
-config.gateway.reload = config.gateway.reload || {};
-config.gateway.reload.mode = 'off';
-config.gateway.auth = config.gateway.auth || {};
-config.gateway.auth.mode = 'trusted-proxy';
-config.gateway.auth.trustedProxy = config.gateway.auth.trustedProxy || {};
-config.gateway.auth.trustedProxy.userHeader = 'x-forwarded-user';
-config.gateway.auth.trustedProxy.requiredHeaders = [
-  'x-clawnow-verified',
+	config.gateway.reload = config.gateway.reload || {};
+	config.gateway.reload.mode = 'off';
+	config.gateway.auth = config.gateway.auth || {};
+	// Gateway binds to loopback and is only reachable through the local ClawNow proxy.
+	// Use "none" here so local CLI/doctor/browser probes can connect directly without
+	// needing trusted-proxy headers (the proxy already enforces session auth).
+	config.gateway.auth.mode = 'none';
+	config.gateway.auth.trustedProxy = config.gateway.auth.trustedProxy || {};
+	config.gateway.auth.trustedProxy.userHeader = 'x-forwarded-user';
+	config.gateway.auth.trustedProxy.requiredHeaders = [
+	  'x-clawnow-verified',
   'x-clawnow-instance-id',
   'x-clawnow-session-type',
 ];
 config.gateway.trustedProxies = ['127.0.0.1', '::1'];
 config.gateway.controlUi = config.gateway.controlUi || {};
 config.gateway.controlUi.basePath = process.env.CONTROL_PREFIX || '/clawnow';
+config.browser =
+  config.browser && typeof config.browser === 'object' && !Array.isArray(config.browser)
+    ? config.browser
+    : {};
+config.browser.enabled = true;
+const browserDefaultProfile =
+  typeof config.browser.defaultProfile === 'string' ? config.browser.defaultProfile.trim() : '';
+if (!browserDefaultProfile || browserDefaultProfile.toLowerCase() === 'chrome') {
+  config.browser.defaultProfile = 'openclaw';
+}
+config.tools =
+  config.tools && typeof config.tools === 'object' && !Array.isArray(config.tools)
+    ? config.tools
+    : {};
+config.tools.exec =
+  config.tools.exec && typeof config.tools.exec === 'object' && !Array.isArray(config.tools.exec)
+    ? config.tools.exec
+    : {};
+// ClawNow runs managed gateway/browser flows; keep shell exec in allowlist mode by default
+// so assistant turns cannot silently run maintenance commands like "openclaw doctor".
+config.tools.exec.security = 'allowlist';
+const execAsk =
+  typeof config.tools.exec.ask === 'string' ? config.tools.exec.ask.trim().toLowerCase() : '';
+if (execAsk !== 'off' && execAsk !== 'on-miss' && execAsk !== 'always') {
+  config.tools.exec.ask = 'on-miss';
+}
 const controlUiRoot = (process.env.CLAWNOW_CONTROL_UI_ROOT || '').trim();
 if (controlUiRoot) {
   config.gateway.controlUi.root = controlUiRoot;
@@ -608,10 +940,30 @@ fi
 
 write_state "systemd" "running" "writing service units"
 log_step "writing systemd units"
+cat >/etc/systemd/system/clawnow-desktop.service <<'EOF_DESKTOP_SERVICE'
+[Unit]
+Description=ClawNow Desktop Runtime
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/clawnow-desktop.env
+ExecStart=/usr/bin/env bash -lc '/opt/clawnow/clawnow-desktop-runtime.sh'
+Restart=always
+RestartSec=3
+User=root
+WorkingDirectory=/opt/clawnow
+
+[Install]
+WantedBy=multi-user.target
+EOF_DESKTOP_SERVICE
+
 cat >/etc/systemd/system/openclaw-gateway.service <<EOF_GATEWAY
 [Unit]
 Description=OpenClaw Gateway
-After=network.target
+After=network.target clawnow-desktop.service
+Wants=clawnow-desktop.service
 StartLimitIntervalSec=0
 
 [Service]
@@ -664,6 +1016,12 @@ if [[ "$ENABLE_HTTPS" == "1" ]]; then
   fi
 fi
 
+write_state "desktop_start" "running" "starting desktop runtime"
+log_step "starting clawnow-desktop.service"
+systemctl enable clawnow-desktop.service
+systemctl restart clawnow-desktop.service
+systemctl is-active clawnow-desktop.service >/dev/null
+
 write_state "gateway_start" "running" "starting openclaw gateway"
 log_step "starting openclaw-gateway.service"
 systemctl enable openclaw-gateway.service
@@ -677,11 +1035,18 @@ systemctl restart clawnow-proxy.service
 systemctl is-active clawnow-proxy.service >/dev/null
 
 if ! wait_for_tcp_port 127.0.0.1 "$GATEWAY_PORT" 120 1; then
+  write_state "failed" "error" "openclaw gateway port ${GATEWAY_PORT} did not become ready in time"
   echo "OpenClaw gateway port ${GATEWAY_PORT} did not become ready in time" >&2
   exit 1
 fi
 if ! wait_for_tcp_port 127.0.0.1 "$PROXY_PORT" 120 1; then
+  write_state "failed" "error" "proxy port ${PROXY_PORT} did not become ready in time"
   echo "ClawNow proxy port ${PROXY_PORT} did not become ready in time" >&2
+  exit 1
+fi
+if ! wait_for_tcp_port 127.0.0.1 "$DESKTOP_NOVNC_PORT" 120 1; then
+  write_state "failed" "error" "desktop novnc port ${DESKTOP_NOVNC_PORT} did not become ready in time"
+  echo "Desktop noVNC port ${DESKTOP_NOVNC_PORT} did not become ready in time" >&2
   exit 1
 fi
 
@@ -693,6 +1058,7 @@ else
   log_step "bootstrap complete: http://${PROXY_BIND}:${PROXY_PORT}${CONTROL_PREFIX}/"
 fi
 
+systemctl is-active clawnow-desktop.service
 systemctl is-active openclaw-gateway.service
 systemctl is-active clawnow-proxy.service
 if [[ "$ENABLE_HTTPS" == "1" ]]; then
