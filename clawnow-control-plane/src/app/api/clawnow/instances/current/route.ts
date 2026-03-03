@@ -13,10 +13,14 @@ export async function GET(request: NextRequest) {
 
   try {
     const service = createClawNowService();
-    const instance = await service.getCurrentInstance(auth.userId);
+    const [instance, billing] = await Promise.all([
+      service.getCurrentInstance(auth.userId),
+      service.getWorkspaceBillingSummary(auth.userId),
+    ]);
     return NextResponse.json({
       success: true,
       instance,
+      billing,
       config: service.getConfigSummary(),
     });
   } catch (error) {

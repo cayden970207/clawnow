@@ -1,8 +1,8 @@
 "use client";
 
-import { ArrowLeft, ExternalLink, Loader2, Monitor, RefreshCw, Server, Wrench } from "lucide-react";
+import { ArrowLeft, ExternalLink, Loader2, RefreshCw, Server, Wrench } from "lucide-react";
 import { useRouter } from "next/navigation";
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { AuthModal } from "@/components/AuthModal";
 import { useAuth } from "@/contexts/authContext";
 
@@ -38,9 +38,17 @@ interface ClawInstance {
   ipv6: string | null;
   provisioned_at: string | null;
   updated_at: string;
-  novnc_enabled_until: string | null;
   last_error: string | null;
   metadata?: Record<string, unknown>;
+}
+
+interface WorkspaceBillingSummary {
+  status: "ok" | "unavailable";
+  currency: "USD";
+  organizationMembershipCount: number;
+  organizationSubscriptionCount: number;
+  organizationPrepaidBalance: number;
+  message?: string;
 }
 
 interface OnboardingWizardStepOption {
@@ -80,8 +88,7 @@ const CLAWNOW_LOADING_LINES = [
   "Your workspace is almost ready, holding steady.",
 ] as const;
 const DEFAULT_BOOTING_NOTICE = "OpenClaw is warming up. First boot can take around 3-10 minutes.";
-const LIVE_MONITOR_POLL_INTERVAL_MS = 2200;
-const LIVE_MONITOR_ACTIVE_LINGER_MS = 6500;
+const OPENCLAW_BROWSER_DOC_URL = "https://docs.openclaw.ai/tools/browser";
 
 class ApiError extends Error {
   code: string;
@@ -131,6 +138,15 @@ function getStatusClass(status?: ClawInstanceStatus): string {
     return "bg-[#FDECEC] text-[#B3261E] border-[#F6CACA]";
   }
   return "bg-[#F5F5F5] text-[#666] border-[#E7E7E7]";
+}
+
+function formatCurrencyUsd(value: number): string {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(value);
 }
 
 function isOnboardingStepType(value: unknown): value is OnboardingStepType {
@@ -313,30 +329,6 @@ function isInstanceOnboardingComplete(instance: ClawInstance | null): boolean {
   return typeof completedAt === "string" && completedAt.trim().length > 0;
 }
 
-function normalizeDesktopLiveUrl(rawUrl: string): string {
-  try {
-    const url = new URL(rawUrl);
-    const normalizedPath = url.pathname.toLowerCase();
-    if (
-      !normalizedPath.endsWith("/vnc.html") &&
-      !normalizedPath.endsWith("/vnc_lite.html") &&
-      !normalizedPath.endsWith("/vnc_auto.html")
-    ) {
-      const trimmedPath = url.pathname.replace(/\/+$/, "");
-      url.pathname = `${trimmedPath || ""}/vnc.html`;
-    }
-    if (!url.searchParams.has("autoconnect")) {
-      url.searchParams.set("autoconnect", "1");
-    }
-    if (!url.searchParams.has("resize")) {
-      url.searchParams.set("resize", "remote");
-    }
-    return url.toString();
-  } catch {
-    return rawUrl;
-  }
-}
-
 async function parseApiResponse<T>(response: Response): Promise<T> {
   const json = await response.json().catch(() => ({}));
   if (!response.ok || !json.success) {
@@ -353,27 +345,16 @@ export default function ClawNowPage() {
 
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [instance, setInstance] = useState<ClawInstance | null>(null);
+  const [billing, setBilling] = useState<WorkspaceBillingSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const [hasLoaded, setHasLoaded] = useState(false);
   const [provisioning, setProvisioning] = useState(false);
   const [recovering, setRecovering] = useState(false);
   const [repairingGatewayDefaults, setRepairingGatewayDefaults] = useState(false);
-  const [openingDesktopLive, setOpeningDesktopLive] = useState(false);
-  const [desktopLiveActive, setDesktopLiveActive] = useState(false);
-  const [desktopLiveLaunchUrl, setDesktopLiveLaunchUrl] = useState<string | null>(null);
-  const [browserTaskLiveActive, setBrowserTaskLiveActive] = useState(false);
-  const [desktopLiveExpiresAt, setDesktopLiveExpiresAt] = useState<string | null>(null);
   const [openingControlUi, setOpeningControlUi] = useState(false);
   const [refreshingHealth, setRefreshingHealth] = useState(false);
   const [loadingMessageIndex, setLoadingMessageIndex] = useState(0);
-  const desktopLiveWindowRef = useRef<Window | null>(null);
-  const liveIndicatorHoldTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const browserTaskLiveActiveRef = useRef(false);
-  const liveMonitorSessionRef = useRef<{
-    gatewayWebSocketUrl: string;
-    expiresAtMs: number;
-  } | null>(null);
 
   const [onboardingBusy, setOnboardingBusy] = useState(false);
   const [onboardingSessionId, setOnboardingSessionId] = useState<string | null>(null);
@@ -400,8 +381,12 @@ export default function ClawNowPage() {
         cache: "no-store",
         signal: controller.signal,
       });
-      const data = await parseApiResponse<{ instance: ClawInstance | null }>(response);
+      const data = await parseApiResponse<{
+        instance: ClawInstance | null;
+        billing?: WorkspaceBillingSummary;
+      }>(response);
       setInstance(data.instance);
+      setBilling(data.billing || null);
     } catch (err: unknown) {
       const isTimeout = err instanceof DOMException && err.name === "AbortError";
       setError(
@@ -501,8 +486,8 @@ export default function ClawNowPage() {
       setInstance(data.instance);
       setOnboardingMessage(
         data.changed
-          ? "Channels and browser defaults repaired. Reopen Gateway and refresh Channels."
-          : "Channels and browser defaults are already up to date.",
+          ? "Channels and VM browser defaults repaired. Open Gateway, then use Desktop Live."
+          : "Channels and VM browser defaults are already up to date.",
       );
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Failed to repair gateway defaults");
@@ -510,74 +495,6 @@ export default function ClawNowPage() {
       setRepairingGatewayDefaults(false);
     }
   }, [getAuthHeaders]);
-
-  const handleOpenDesktopLive = useCallback(async () => {
-    const preOpenedPopup = window.open("", "_blank", "noopener,noreferrer");
-    if (preOpenedPopup && preOpenedPopup.document) {
-      preOpenedPopup.document.title = "Opening Desktop Live...";
-      preOpenedPopup.document.body.innerHTML =
-        "<p style='font-family:system-ui;padding:24px;'>Opening Desktop Live...</p>";
-    }
-
-    setOpeningDesktopLive(true);
-    setError(null);
-    setOnboardingMessage(null);
-    try {
-      const headers = await getAuthHeaders();
-      const response = await fetch("/api/clawnow/instances/novnc/session", {
-        method: "POST",
-        headers,
-      });
-      const data = await parseApiResponse<{
-        launchUrl: string;
-        expiresAt: string;
-        durationMinutes: number;
-        instance: ClawInstance;
-      }>(response);
-      const launchUrl = normalizeDesktopLiveUrl(data.launchUrl);
-      setInstance(data.instance);
-      setBrowserTaskLiveActive(false);
-      liveMonitorSessionRef.current = null;
-      setDesktopLiveActive(true);
-      setDesktopLiveLaunchUrl(launchUrl);
-      setDesktopLiveExpiresAt(data.expiresAt);
-
-      let popup = preOpenedPopup;
-      if (popup && !popup.closed) {
-        popup.location.href = launchUrl;
-      } else {
-        popup = window.open(launchUrl, "_blank", "noopener,noreferrer");
-      }
-      desktopLiveWindowRef.current = popup;
-      setOnboardingMessage(
-        popup
-          ? `Desktop Live opened (${data.durationMinutes} min). Keep that tab open to watch browser actions in real time.`
-          : `Desktop Live URL ready (${data.durationMinutes} min), but popup was blocked. Allow popups, then click Re-open Desktop Live.`,
-      );
-    } catch (err: unknown) {
-      if (preOpenedPopup && !preOpenedPopup.closed) {
-        preOpenedPopup.close();
-      }
-      setError(err instanceof Error ? err.message : "Failed to open Desktop Live");
-    } finally {
-      setOpeningDesktopLive(false);
-    }
-  }, [getAuthHeaders]);
-
-  const handleReopenDesktopLive = useCallback(() => {
-    if (!desktopLiveLaunchUrl) {
-      return;
-    }
-    setError(null);
-    const popup = window.open(desktopLiveLaunchUrl, "_blank", "noopener,noreferrer");
-    if (!popup) {
-      setError("Popup was blocked. Please allow popups for this site and try again.");
-      return;
-    }
-    desktopLiveWindowRef.current = popup;
-    setDesktopLiveActive(true);
-    setOnboardingMessage("Desktop Live reopened.");
-  }, [desktopLiveLaunchUrl]);
 
   const handleOpenControlUi = useCallback(async () => {
     setOpeningControlUi(true);
@@ -648,7 +565,7 @@ export default function ClawNowPage() {
         setManualWizardMode(false);
         setOnboardingMessage(
           result.status === "done"
-            ? "Terminal onboarding completed."
+            ? "Setup completed. Next: open Gateway and use Desktop Live to observe VM browser actions."
             : result.error || "Onboarding completed.",
         );
       }
@@ -784,7 +701,7 @@ export default function ClawNowPage() {
             setOnboardingOAuthUrl(null);
             setOnboardingMessage(
               result.status === "done"
-                ? "Terminal onboarding completed. Model auth and channels are now configured."
+                ? "Setup completed. Next: open Gateway and use Desktop Live to observe VM browser actions."
                 : result.error || "Onboarding finished.",
             );
           }
@@ -805,6 +722,9 @@ export default function ClawNowPage() {
         setOnboardingStep(null);
         setOnboardingStepValue(null);
         setOnboardingOAuthUrl(null);
+      }
+      if (err instanceof ApiError && err.code === "GATEWAY_WARMING_UP") {
+        void handleRefreshHealth(true);
       }
       if (isGatewayWebSocketOpenError(err)) {
         void handleRefreshHealth(true);
@@ -884,46 +804,7 @@ export default function ClawNowPage() {
     setOnboardingMessage(null);
     setOnboardingOAuthUrl(null);
     setManualWizardMode(false);
-    setDesktopLiveActive(false);
-    setDesktopLiveLaunchUrl(null);
-    setBrowserTaskLiveActive(false);
-    setDesktopLiveExpiresAt(null);
-    desktopLiveWindowRef.current = null;
-    liveMonitorSessionRef.current = null;
   }, [instance?.id]);
-
-  useEffect(() => {
-    browserTaskLiveActiveRef.current = browserTaskLiveActive;
-  }, [browserTaskLiveActive]);
-
-  useEffect(() => {
-    return () => {
-      if (liveIndicatorHoldTimerRef.current) {
-        clearTimeout(liveIndicatorHoldTimerRef.current);
-        liveIndicatorHoldTimerRef.current = null;
-      }
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!desktopLiveActive) {
-      return;
-    }
-    const timer = setInterval(() => {
-      const popup = desktopLiveWindowRef.current;
-      if (popup && !popup.closed) {
-        return;
-      }
-      setDesktopLiveActive(false);
-      if (liveIndicatorHoldTimerRef.current) {
-        clearTimeout(liveIndicatorHoldTimerRef.current);
-        liveIndicatorHoldTimerRef.current = null;
-      }
-      setBrowserTaskLiveActive(false);
-      liveMonitorSessionRef.current = null;
-    }, 2000);
-    return () => clearInterval(timer);
-  }, [desktopLiveActive]);
 
   useEffect(() => {
     setOnboardingOAuthUrl(null);
@@ -984,149 +865,47 @@ export default function ClawNowPage() {
   const showOAuthLoginShortcut = isRedirectUrlInputStep(onboardingStep);
   const isPreparingOrStarting = isWorkspaceLoading || workspaceStage === "booting";
   const loadingLine = CLAWNOW_LOADING_LINES[loadingMessageIndex];
-  const desktopLiveExpiresLabel = useMemo(() => {
-    if (!desktopLiveExpiresAt) {
-      return null;
-    }
-    const expires = new Date(desktopLiveExpiresAt);
-    if (!Number.isFinite(expires.getTime())) {
-      return null;
-    }
-    return expires.toLocaleTimeString();
-  }, [desktopLiveExpiresAt]);
-
-  useEffect(() => {
-    if (!desktopLiveActive || !canOpenSession || !onboardingCompleted) {
-      if (liveIndicatorHoldTimerRef.current) {
-        clearTimeout(liveIndicatorHoldTimerRef.current);
-        liveIndicatorHoldTimerRef.current = null;
-      }
-      setBrowserTaskLiveActive(false);
-      liveMonitorSessionRef.current = null;
-      return;
-    }
-
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-
-    const setBrowserLiveState = (active: boolean) => {
-      if (active) {
-        if (liveIndicatorHoldTimerRef.current) {
-          clearTimeout(liveIndicatorHoldTimerRef.current);
-          liveIndicatorHoldTimerRef.current = null;
-        }
-        setBrowserTaskLiveActive(true);
-        return;
-      }
-      if (!browserTaskLiveActiveRef.current) {
-        return;
-      }
-      if (liveIndicatorHoldTimerRef.current) {
-        return;
-      }
-      liveIndicatorHoldTimerRef.current = setTimeout(() => {
-        liveIndicatorHoldTimerRef.current = null;
-        setBrowserTaskLiveActive(false);
-      }, LIVE_MONITOR_ACTIVE_LINGER_MS);
-    };
-
-    const hasFreshMonitorSession = (): boolean => {
-      const session = liveMonitorSessionRef.current;
-      if (!session) {
-        return false;
-      }
-      return session.expiresAtMs - Date.now() > 15_000;
-    };
-
-    const createMonitorSession = async (): Promise<string> => {
-      const headers = await getAuthHeaders();
-      const response = await fetch("/api/clawnow/instances/live-monitor/session", {
-        method: "POST",
-        headers,
-        cache: "no-store",
-      });
-      const data = await parseApiResponse<{
-        gatewayWebSocketUrl: string;
-        expiresAt: string;
-      }>(response);
-      const expiresAtMs = new Date(data.expiresAt).getTime();
-      liveMonitorSessionRef.current = {
-        gatewayWebSocketUrl: data.gatewayWebSocketUrl,
-        expiresAtMs: Number.isFinite(expiresAtMs) ? expiresAtMs : Date.now() + 240_000,
+  const organizationBalanceSummary = useMemo(() => {
+    if (!billing) {
+      return {
+        value: "—",
+        detail: "Organization balance is syncing.",
+        tone: "neutral" as const,
       };
-      return data.gatewayWebSocketUrl;
-    };
+    }
+    if (billing.status === "unavailable") {
+      return {
+        value: "Unavailable",
+        detail: billing.message || "Organization billing data is temporarily unavailable.",
+        tone: "warning" as const,
+      };
+    }
+    if (billing.organizationMembershipCount === 0) {
+      return {
+        value: formatCurrencyUsd(0),
+        detail: "No linked organization membership yet.",
+        tone: "neutral" as const,
+      };
+    }
 
-    const resolveMonitorSessionUrl = async (): Promise<string> => {
-      if (hasFreshMonitorSession()) {
-        return liveMonitorSessionRef.current!.gatewayWebSocketUrl;
-      }
-      return await createMonitorSession();
-    };
+    const orgLabel =
+      billing.organizationSubscriptionCount === 1
+        ? "active organization subscription"
+        : "active organization subscriptions";
+    if (billing.organizationSubscriptionCount === 0) {
+      return {
+        value: formatCurrencyUsd(0),
+        detail: `Linked to ${billing.organizationMembershipCount} organizations, but no active CreateNow prepaid subscription found.`,
+        tone: "neutral" as const,
+      };
+    }
 
-    const isRecoverableMonitorError = (err: unknown): boolean => {
-      if (!(err instanceof ApiError)) {
-        return false;
-      }
-      return (
-        err.code === "GATEWAY_REQUEST_FAILED" ||
-        err.code === "GATEWAY_CONNECT_FAILED" ||
-        err.code === "GATEWAY_TIMEOUT" ||
-        err.code === "GATEWAY_SOCKET_CLOSED" ||
-        err.code === "GATEWAY_SESSION_MISMATCH"
-      );
+    return {
+      value: formatCurrencyUsd(billing.organizationPrepaidBalance),
+      detail: `Across ${billing.organizationSubscriptionCount} ${orgLabel}.`,
+      tone: "positive" as const,
     };
-
-    const pollMonitor = async () => {
-      try {
-        const gatewayWebSocketUrl = await resolveMonitorSessionUrl();
-        const headers = await getAuthHeaders();
-        const response = await fetch("/api/clawnow/instances/live-monitor/activity", {
-          method: "POST",
-          headers: {
-            ...headers,
-            "content-type": "application/json",
-          },
-          body: JSON.stringify({ gatewayWebSocketUrl }),
-          cache: "no-store",
-        });
-        const data = await parseApiResponse<{ active: boolean }>(response);
-        if (cancelled) {
-          return;
-        }
-        setBrowserLiveState(Boolean(data.active));
-      } catch (err: unknown) {
-        if (cancelled) {
-          return;
-        }
-        setBrowserLiveState(false);
-        if (isRecoverableMonitorError(err)) {
-          liveMonitorSessionRef.current = null;
-        }
-      } finally {
-        if (!cancelled) {
-          timer = setTimeout(() => {
-            void pollMonitor();
-          }, LIVE_MONITOR_POLL_INTERVAL_MS);
-        }
-      }
-    };
-
-    void pollMonitor();
-
-    return () => {
-      cancelled = true;
-      if (timer) {
-        clearTimeout(timer);
-      }
-      if (liveIndicatorHoldTimerRef.current) {
-        clearTimeout(liveIndicatorHoldTimerRef.current);
-        liveIndicatorHoldTimerRef.current = null;
-      }
-      setBrowserTaskLiveActive(false);
-      liveMonitorSessionRef.current = null;
-    };
-  }, [canOpenSession, desktopLiveActive, getAuthHeaders, onboardingCompleted]);
+  }, [billing]);
 
   const bootingWarnings = useMemo(() => {
     const normalize = (value: string) => value.trim().toLowerCase().replace(/\s+/g, " ");
@@ -1190,6 +969,24 @@ export default function ClawNowPage() {
       </header>
 
       <main className="mx-auto w-full max-w-4xl px-4 py-10 md:px-8 md:py-14">
+        {user && !isWorkspaceLoading && (
+          <section
+            className={`mb-6 rounded-2xl border px-4 py-3 ${
+              organizationBalanceSummary.tone === "warning"
+                ? "border-[#F1D1D1] bg-[#FFF6F6]"
+                : organizationBalanceSummary.tone === "positive"
+                  ? "border-[#DCEFD9] bg-[#F6FFF4]"
+                  : "border-[#EAEAEA] bg-white"
+            }`}
+          >
+            <p className="text-xs uppercase tracking-[0.14em] text-[#7A7A7A]">Organization Balance</p>
+            <p className="mt-1 text-xl font-semibold tracking-tight text-[#111]">
+              {organizationBalanceSummary.value}
+            </p>
+            <p className="mt-1 text-xs text-[#666]">{organizationBalanceSummary.detail}</p>
+          </section>
+        )}
+
         {isWorkspaceLoading ? (
           <section className="mx-auto max-w-3xl rounded-3xl border border-[#EAEAEA] bg-white p-8 shadow-[0_10px_35px_rgba(0,0,0,0.05)] md:p-10">
             <div className="inline-flex items-center gap-2 rounded-full border border-[#E7E7E7] bg-[#FAFAFA] px-3 py-1 text-xs font-medium text-[#5F5F5F]">
@@ -1600,12 +1397,6 @@ export default function ClawNowPage() {
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
-                  {desktopLiveActive && browserTaskLiveActive && (
-                    <span className="inline-flex items-center gap-2 rounded-full border border-[#F6CACA] bg-[#FFF6F6] px-3 py-1 text-xs font-semibold text-[#B3261E]">
-                      <span className="h-2 w-2 animate-pulse rounded-full bg-[#B3261E]" />
-                      LIVE
-                    </span>
-                  )}
                   <span
                     className={`rounded-full border px-3 py-1 text-xs font-medium ${getStatusClass(instance?.status)}`}
                   >
@@ -1655,32 +1446,6 @@ export default function ClawNowPage() {
                       {canLaunchGateway ? "Launch Gateway" : "Complete Setup Wizard First"}
                     </button>
 
-                    {canOpenSession && (
-                      <button
-                        onClick={handleOpenDesktopLive}
-                        disabled={openingDesktopLive}
-                        className="inline-flex items-center gap-2 rounded-full border border-[#DCDCDC] bg-white px-5 py-2.5 text-sm font-semibold text-[#111] transition hover:bg-[#F6F6F6] disabled:cursor-not-allowed disabled:opacity-60"
-                      >
-                        {openingDesktopLive ? (
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                        ) : (
-                          <Monitor className="h-4 w-4" />
-                        )}
-                        {openingDesktopLive ? "Opening Desktop..." : "Open Desktop Live"}
-                      </button>
-                    )}
-
-                    {desktopLiveLaunchUrl && canOpenSession && (
-                      <button
-                        onClick={handleReopenDesktopLive}
-                        disabled={openingDesktopLive}
-                        className="inline-flex items-center gap-2 rounded-full border border-[#DCDCDC] bg-white px-5 py-2.5 text-sm font-semibold text-[#111] transition hover:bg-[#F6F6F6] disabled:cursor-not-allowed disabled:opacity-60"
-                      >
-                        <ExternalLink className="h-4 w-4" />
-                        Re-open Desktop Live
-                      </button>
-                    )}
-
                     {onboardingCompleted && canOpenSession && (
                       <button
                         onClick={() => {
@@ -1706,7 +1471,7 @@ export default function ClawNowPage() {
                         ) : (
                           <Wrench className="h-4 w-4" />
                         )}
-                        {repairingGatewayDefaults ? "Repairing..." : "Fix Channels & Browser"}
+                        {repairingGatewayDefaults ? "Repairing..." : "Fix Channels & VM Browser"}
                       </button>
                     )}
                   </>
@@ -1715,23 +1480,26 @@ export default function ClawNowPage() {
 
               {canOpenSession && (
                 <div className="mt-4 rounded-2xl border border-[#EFEFEF] bg-[#FAFAFA] px-4 py-3 text-sm text-[#555]">
-                  {desktopLiveActive && browserTaskLiveActive ? (
-                    <p>
-                      Browser task is running
-                      {desktopLiveExpiresLabel ? ` (expires around ${desktopLiveExpiresLabel})` : ""}
-                      . Keep the Desktop Live tab open while agent runs browser tasks.
-                    </p>
-                  ) : desktopLiveActive ? (
-                    <p>
-                      Desktop Live connected. LIVE lights up only while the agent is actively using
-                      the browser (with a short anti-flicker delay).
-                    </p>
-                  ) : (
-                    <p>
-                      Tip: click <strong>Open Desktop Live</strong> to watch browser automation in
-                      real time while the agent works.
-                    </p>
-                  )}
+                  <p>
+                    Browser automation now focuses on <strong>VM-side browser</strong>. Launch Gateway,
+                    then click <strong>Open Desktop Live</strong> in the Gateway top bar to watch the
+                    agent operate in real time.
+                  </p>
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <a
+                      href={OPENCLAW_BROWSER_DOC_URL}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center justify-center gap-2 rounded-full border border-[#DCDCDC] bg-white px-4 py-2 text-xs font-semibold text-[#111] transition hover:bg-[#F6F6F6]"
+                    >
+                      <ExternalLink className="h-3.5 w-3.5" />
+                      Browser Docs
+                    </a>
+                  </div>
+                  <p className="mt-2 text-xs text-[#777]">
+                    Recommended browser profile: <code>openclaw</code>. This route keeps execution in
+                    the VM and visible via Desktop Live.
+                  </p>
                 </div>
               )}
 
@@ -1771,7 +1539,8 @@ export default function ClawNowPage() {
 
               {onboardingCompleted && (
                 <p className="mt-3 text-xs text-[#0B7A2A]">
-                  Setup wizard completed. Launch gateway any time.
+                  Setup wizard completed. Launch Gateway, then use Desktop Live to observe VM browser
+                  actions.
                 </p>
               )}
 
