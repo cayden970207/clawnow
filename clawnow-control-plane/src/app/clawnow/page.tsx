@@ -48,7 +48,19 @@ interface WorkspaceBillingSummary {
   organizationMembershipCount: number;
   organizationSubscriptionCount: number;
   organizationPrepaidBalance: number;
+  selectedOrganizationId: string | null;
+  selectedOrganizationName: string | null;
+  selectedOrganizationPrepaidBalance: number | null;
+  organizations: WorkspaceBillingOrganization[];
   message?: string;
+}
+
+interface WorkspaceBillingOrganization {
+  id: string;
+  name: string;
+  slug: string | null;
+  prepaidBalance: number;
+  hasActiveSubscription: boolean;
 }
 
 interface OnboardingWizardStepOption {
@@ -346,6 +358,7 @@ export default function ClawNowPage() {
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [instance, setInstance] = useState<ClawInstance | null>(null);
   const [billing, setBilling] = useState<WorkspaceBillingSummary | null>(null);
+  const [selectedOrganizationId, setSelectedOrganizationId] = useState<string>("all");
   const [error, setError] = useState<string | null>(null);
 
   const [hasLoaded, setHasLoaded] = useState(false);
@@ -367,6 +380,16 @@ export default function ClawNowPage() {
   const [onboardingOAuthBusy, setOnboardingOAuthBusy] = useState(false);
   const [manualWizardMode, setManualWizardMode] = useState(false);
 
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const queryOrgId = new URLSearchParams(window.location.search).get("orgId");
+    if (queryOrgId && queryOrgId.trim()) {
+      setSelectedOrganizationId(queryOrgId.trim());
+    }
+  }, []);
+
   const loadCurrent = useCallback(async () => {
     if (!user) {
       return;
@@ -376,7 +399,11 @@ export default function ClawNowPage() {
     const timeout = setTimeout(() => controller.abort(), 10000);
     try {
       const headers = await getAuthHeaders();
-      const response = await fetch("/api/clawnow/instances/current", {
+      const endpoint =
+        selectedOrganizationId !== "all"
+          ? `/api/clawnow/instances/current?orgId=${encodeURIComponent(selectedOrganizationId)}`
+          : "/api/clawnow/instances/current";
+      const response = await fetch(endpoint, {
         headers,
         cache: "no-store",
         signal: controller.signal,
@@ -400,7 +427,35 @@ export default function ClawNowPage() {
       clearTimeout(timeout);
       setHasLoaded(true);
     }
-  }, [getAuthHeaders, user]);
+  }, [getAuthHeaders, selectedOrganizationId, user]);
+
+  const updateOrganizationFilter = useCallback((nextOrganizationId: string) => {
+    setSelectedOrganizationId(nextOrganizationId);
+    if (typeof window === "undefined") {
+      return;
+    }
+    const url = new URL(window.location.href);
+    if (nextOrganizationId === "all") {
+      url.searchParams.delete("orgId");
+    } else {
+      url.searchParams.set("orgId", nextOrganizationId);
+    }
+    window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+  }, []);
+
+  useEffect(() => {
+    if (!billing || billing.status !== "ok") {
+      return;
+    }
+    if (selectedOrganizationId === "all") {
+      return;
+    }
+    if (billing.selectedOrganizationId) {
+      return;
+    }
+    // Keep URL and client filter in sync when requested org is no longer valid.
+    updateOrganizationFilter("all");
+  }, [billing, selectedOrganizationId, updateOrganizationFilter]);
 
   const handleProvision = useCallback(async () => {
     setProvisioning(true);
@@ -870,6 +925,7 @@ export default function ClawNowPage() {
       return {
         value: "—",
         detail: "Organization balance is syncing.",
+        label: "All orgs",
         tone: "neutral" as const,
       };
     }
@@ -877,13 +933,24 @@ export default function ClawNowPage() {
       return {
         value: "Unavailable",
         detail: billing.message || "Organization billing data is temporarily unavailable.",
+        label: "All orgs",
         tone: "warning" as const,
+      };
+    }
+    if (billing.selectedOrganizationId) {
+      const selectedBalance = Number(billing.selectedOrganizationPrepaidBalance ?? 0);
+      return {
+        value: formatCurrencyUsd(Number.isFinite(selectedBalance) ? selectedBalance : 0),
+        detail: "Usage will charge this organization workspace balance.",
+        label: billing.selectedOrganizationName || "Selected org",
+        tone: selectedBalance > 0 ? ("positive" as const) : ("neutral" as const),
       };
     }
     if (billing.organizationMembershipCount === 0) {
       return {
         value: formatCurrencyUsd(0),
         detail: "No linked organization membership yet.",
+        label: "All orgs",
         tone: "neutral" as const,
       };
     }
@@ -896,6 +963,7 @@ export default function ClawNowPage() {
       return {
         value: formatCurrencyUsd(0),
         detail: `Linked to ${billing.organizationMembershipCount} organizations, but no active CreateNow prepaid subscription found.`,
+        label: "All orgs",
         tone: "neutral" as const,
       };
     }
@@ -903,6 +971,7 @@ export default function ClawNowPage() {
     return {
       value: formatCurrencyUsd(billing.organizationPrepaidBalance),
       detail: `Across ${billing.organizationSubscriptionCount} ${orgLabel}.`,
+      label: "All orgs",
       tone: "positive" as const,
     };
   }, [billing]);
@@ -955,38 +1024,58 @@ export default function ClawNowPage() {
   return (
     <div className="min-h-screen bg-[#F7F7F5] text-[#191919]">
       <header className="sticky top-0 z-10 border-b border-[#ECECEC] bg-[#F7F7F5]/90 px-4 py-4 backdrop-blur md:px-8">
-        <div className="flex items-center gap-3">
-          <button
-            onClick={() => router.push("/")}
-            className="inline-flex items-center gap-2 rounded-full border border-[#E4E4E4] bg-white px-3 py-1.5 text-sm text-[#666] transition hover:border-[#D8D8D8] hover:text-[#111]"
-          >
-            <ArrowLeft className="h-4 w-4" />
-            Back
-          </button>
-          <div className="hidden h-5 w-px bg-[#E7E7E7] md:block" />
-          <p className="text-sm font-medium uppercase tracking-[0.22em] text-[#6D6D6D]">ClawNow</p>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => router.push("/")}
+              className="inline-flex items-center gap-2 rounded-full border border-[#E4E4E4] bg-white px-3 py-1.5 text-sm text-[#666] transition hover:border-[#D8D8D8] hover:text-[#111]"
+            >
+              <ArrowLeft className="h-4 w-4" />
+              Back
+            </button>
+            <div className="hidden h-5 w-px bg-[#E7E7E7] md:block" />
+            <p className="text-sm font-medium uppercase tracking-[0.22em] text-[#6D6D6D]">
+              ClawNow
+            </p>
+          </div>
+
+          {user && !isWorkspaceLoading && (
+            <div className="flex flex-wrap items-center gap-2">
+              {billing?.status === "ok" && (billing.organizations || []).length > 1 && (
+                <select
+                  value={selectedOrganizationId}
+                  onChange={(event) => updateOrganizationFilter(event.target.value)}
+                  className="h-9 rounded-full border border-[#DCDCDC] bg-white px-3 text-sm text-[#333] outline-none transition hover:border-[#CFCFCF] focus:border-[#BDBDBD]"
+                >
+                  <option value="all">All organizations</option>
+                  {billing.organizations.map((organization) => (
+                    <option key={organization.id} value={organization.id}>
+                      {organization.name}
+                    </option>
+                  ))}
+                </select>
+              )}
+
+              <div
+                className={`inline-flex min-h-9 items-center gap-2 rounded-full border px-3 py-1 text-sm font-medium ${
+                  organizationBalanceSummary.tone === "warning"
+                    ? "border-[#F1D1D1] bg-[#FFF6F6] text-[#9D1B1B]"
+                    : organizationBalanceSummary.tone === "positive"
+                      ? "border-[#DCEFD9] bg-[#F6FFF4] text-[#0B7A2A]"
+                      : "border-[#EAEAEA] bg-white text-[#555]"
+                }`}
+              >
+                <span className="text-xs uppercase tracking-[0.12em] text-[#7A7A7A]">
+                  {organizationBalanceSummary.label}
+                </span>
+                <span>{organizationBalanceSummary.value}</span>
+              </div>
+            </div>
+          )}
         </div>
       </header>
 
       <main className="mx-auto w-full max-w-4xl px-4 py-10 md:px-8 md:py-14">
-        {user && !isWorkspaceLoading && (
-          <section
-            className={`mb-6 rounded-2xl border px-4 py-3 ${
-              organizationBalanceSummary.tone === "warning"
-                ? "border-[#F1D1D1] bg-[#FFF6F6]"
-                : organizationBalanceSummary.tone === "positive"
-                  ? "border-[#DCEFD9] bg-[#F6FFF4]"
-                  : "border-[#EAEAEA] bg-white"
-            }`}
-          >
-            <p className="text-xs uppercase tracking-[0.14em] text-[#7A7A7A]">Organization Balance</p>
-            <p className="mt-1 text-xl font-semibold tracking-tight text-[#111]">
-              {organizationBalanceSummary.value}
-            </p>
-            <p className="mt-1 text-xs text-[#666]">{organizationBalanceSummary.detail}</p>
-          </section>
-        )}
-
         {isWorkspaceLoading ? (
           <section className="mx-auto max-w-3xl rounded-3xl border border-[#EAEAEA] bg-white p-8 shadow-[0_10px_35px_rgba(0,0,0,0.05)] md:p-10">
             <div className="inline-flex items-center gap-2 rounded-full border border-[#E7E7E7] bg-[#FAFAFA] px-3 py-1 text-xs font-medium text-[#5F5F5F]">

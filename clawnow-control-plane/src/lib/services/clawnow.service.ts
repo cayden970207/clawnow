@@ -71,7 +71,19 @@ export interface ClawWorkspaceBillingSummary {
   organizationMembershipCount: number;
   organizationSubscriptionCount: number;
   organizationPrepaidBalance: number;
+  selectedOrganizationId: string | null;
+  selectedOrganizationName: string | null;
+  selectedOrganizationPrepaidBalance: number | null;
+  organizations: ClawWorkspaceBillingOrganization[];
   message?: string;
+}
+
+export interface ClawWorkspaceBillingOrganization {
+  id: string;
+  name: string;
+  slug: string | null;
+  prepaidBalance: number;
+  hasActiveSubscription: boolean;
 }
 
 export type OnboardingWizardStatus = "running" | "done" | "cancelled" | "error";
@@ -108,6 +120,18 @@ export interface OnboardingWizardStatusResult {
 
 interface OrganizationMembershipRow {
   organization_id: string;
+  organizations?:
+    | {
+        id?: string | null;
+        name?: string | null;
+        slug?: string | null;
+      }
+    | Array<{
+        id?: string | null;
+        name?: string | null;
+        slug?: string | null;
+      }>
+    | null;
 }
 
 interface OrganizationSubscriptionBalanceRow {
@@ -552,34 +576,69 @@ export class ClawNowService {
     return health.instance;
   }
 
-  async getWorkspaceBillingSummary(userId: string): Promise<ClawWorkspaceBillingSummary> {
+  async getWorkspaceBillingSummary(
+    userId: string,
+    options?: { organizationId?: string | null },
+  ): Promise<ClawWorkspaceBillingSummary> {
+    const requestedOrganizationId = options?.organizationId?.trim() || null;
     const baseSummary: ClawWorkspaceBillingSummary = {
       status: "ok",
       currency: "USD",
       organizationMembershipCount: 0,
       organizationSubscriptionCount: 0,
       organizationPrepaidBalance: 0,
+      selectedOrganizationId: null,
+      selectedOrganizationName: null,
+      selectedOrganizationPrepaidBalance: null,
+      organizations: [],
     };
 
     try {
       const { data: memberships, error: membershipError } = await supabaseAdmin
         .from("organization_members")
-        .select("organization_id")
+        .select("organization_id, organizations(id, name, slug)")
         .eq("user_id", userId);
 
       if (membershipError) {
         throw membershipError;
       }
 
-      const organizationIds = Array.from(
-        new Set(
-          ((memberships as OrganizationMembershipRow[] | null) || [])
-            .map((row) => row.organization_id)
-            .filter((organizationId): organizationId is string =>
-              typeof organizationId === "string" ? organizationId.trim().length > 0 : false,
-            ),
-        ),
-      );
+      const membershipsList = (memberships as OrganizationMembershipRow[] | null) || [];
+      const organizationProfiles = new Map<
+        string,
+        { id: string; name: string; slug: string | null }
+      >();
+
+      for (const row of membershipsList) {
+        const organizationId =
+          typeof row.organization_id === "string" ? row.organization_id.trim() : "";
+        if (!organizationId) {
+          continue;
+        }
+        if (!organizationProfiles.has(organizationId)) {
+          organizationProfiles.set(organizationId, {
+            id: organizationId,
+            name: "Organization",
+            slug: null,
+          });
+        }
+
+        const rawOrg = Array.isArray(row.organizations) ? row.organizations[0] : row.organizations;
+        if (!rawOrg || typeof rawOrg !== "object") {
+          continue;
+        }
+        const profile = organizationProfiles.get(organizationId);
+        if (!profile) {
+          continue;
+        }
+
+        const name = typeof rawOrg.name === "string" ? rawOrg.name.trim() : "";
+        const slug = typeof rawOrg.slug === "string" ? rawOrg.slug.trim() : "";
+        profile.name = name || profile.name;
+        profile.slug = slug || profile.slug;
+      }
+
+      const organizationIds = [...organizationProfiles.keys()];
 
       if (organizationIds.length === 0) {
         return baseSummary;
@@ -617,11 +676,42 @@ export class ClawNowService {
         0,
       );
 
+      const organizations = organizationIds
+        .map((organizationId) => {
+          const profile = organizationProfiles.get(organizationId);
+          const prepaidBalance = latestBalancePerOrg.get(organizationId) ?? 0;
+          return {
+            id: organizationId,
+            name: profile?.name || "Organization",
+            slug: profile?.slug || null,
+            prepaidBalance,
+            hasActiveSubscription: latestBalancePerOrg.has(organizationId),
+          } satisfies ClawWorkspaceBillingOrganization;
+        })
+        .sort((left, right) => left.name.localeCompare(right.name));
+
+      const selectedOrganization =
+        requestedOrganizationId && organizationProfiles.has(requestedOrganizationId)
+          ? organizations.find((organization) => organization.id === requestedOrganizationId) || null
+          : organizations.length === 1
+            ? organizations[0]
+            : null;
+
+      const selectionWarning =
+        requestedOrganizationId && !organizationProfiles.has(requestedOrganizationId)
+          ? "Selected organization is not in your workspace. Showing all organization balances."
+          : undefined;
+
       return {
         ...baseSummary,
         organizationMembershipCount: organizationIds.length,
         organizationSubscriptionCount: latestBalancePerOrg.size,
         organizationPrepaidBalance,
+        selectedOrganizationId: selectedOrganization?.id || null,
+        selectedOrganizationName: selectedOrganization?.name || null,
+        selectedOrganizationPrepaidBalance: selectedOrganization?.prepaidBalance ?? null,
+        organizations,
+        ...(selectionWarning ? { message: selectionWarning } : {}),
       };
     } catch (error) {
       const schemaNotReady = isSchemaAvailabilityError(error);

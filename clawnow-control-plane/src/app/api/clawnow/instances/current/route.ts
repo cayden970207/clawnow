@@ -12,10 +12,11 @@ export async function GET(request: NextRequest) {
   }
 
   try {
+    const organizationId = request.nextUrl.searchParams.get("orgId");
     const service = createClawNowService();
     const [instance, billing] = await Promise.all([
       service.getCurrentInstance(auth.userId),
-      service.getWorkspaceBillingSummary(auth.userId),
+      service.getWorkspaceBillingSummary(auth.userId, { organizationId }),
     ]);
     return NextResponse.json({
       success: true,
