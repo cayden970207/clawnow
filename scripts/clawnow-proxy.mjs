@@ -74,6 +74,14 @@ function parsePort(value, fallback) {
   return parsed;
 }
 
+function parsePositiveInt(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    return fallback;
+  }
+  return parsed;
+}
+
 function parseUpstream(name, fallback) {
   const raw = process.env[name]?.trim() || fallback;
   let parsed;
@@ -86,6 +94,49 @@ function parseUpstream(name, fallback) {
     throw new Error(`${name} must use http:// or https://`);
   }
   return parsed;
+}
+
+function parseLoopbackLocalAddress(value, fallback) {
+  const raw = (value || "").trim();
+  if (!raw) {
+    return fallback;
+  }
+  if (net.isIP(raw) !== 4) {
+    return fallback;
+  }
+  // Keep it loopback-only; this is used to force proxy -> gateway source IP.
+  if (!raw.startsWith("127.")) {
+    return fallback;
+  }
+  return raw;
+}
+
+function isLoopbackRemoteAddress(remoteAddress) {
+  const raw = typeof remoteAddress === "string" ? remoteAddress.trim() : "";
+  if (!raw) {
+    return false;
+  }
+  if (raw === "::1") {
+    return true;
+  }
+  if (raw.startsWith("::ffff:")) {
+    const mapped = raw.slice("::ffff:".length);
+    return net.isIP(mapped) === 4 && mapped.startsWith("127.");
+  }
+  return net.isIP(raw) === 4 && raw.startsWith("127.");
+}
+
+function hasForwardedHeaders(req) {
+  return Boolean(
+    req.headers["x-forwarded-for"] ||
+      req.headers["x-real-ip"] ||
+      req.headers["x-forwarded-host"] ||
+      req.headers["x-forwarded-proto"],
+  );
+}
+
+function isDirectLoopbackClient(req) {
+  return isLoopbackRemoteAddress(req.socket?.remoteAddress) && !hasForwardedHeaders(req);
 }
 
 function normalizePrefix(value, fallback) {
@@ -144,7 +195,12 @@ function verifySignedToken(token, config) {
   if (typeof payload.exp !== "number") {
     throw new Error("missing_exp");
   }
-  if (payload.exp <= Math.floor(Date.now() / 1000)) {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const tokenClockSkewSeconds =
+    Number.isFinite(config.tokenClockSkewSeconds) && config.tokenClockSkewSeconds > 0
+      ? Math.floor(config.tokenClockSkewSeconds)
+      : 0;
+  if (payload.exp + tokenClockSkewSeconds <= nowSeconds) {
     throw new Error("token_expired");
   }
   if (typeof payload.instance_id !== "string" || payload.instance_id.trim() === "") {
@@ -479,12 +535,22 @@ function enforceGatewayTrustedProxyConfig(config) {
 
   const next = existing && typeof existing === "object" && !Array.isArray(existing) ? existing : {};
   next.gateway = next.gateway || {};
-  next.gateway.mode = next.gateway.mode || "local";
+  const localGatewayUrl = `ws://127.0.0.1:${config.port}${config.localGatewayPrefix}`;
+  // Route all VM-local CLI/agent gateway RPC through the local proxy path.
+  // This isolates local calls from trusted-proxy header requirements while
+  // keeping public browser traffic on managed trusted-proxy auth.
+  next.gateway.mode = "remote";
+  next.gateway.remote =
+    next.gateway.remote && typeof next.gateway.remote === "object" && !Array.isArray(next.gateway.remote)
+      ? next.gateway.remote
+      : {};
+  next.gateway.remote.url = localGatewayUrl;
+  delete next.gateway.remote.token;
+  delete next.gateway.remote.password;
   next.gateway.auth = next.gateway.auth || {};
-  // Gateway binds to loopback and is only reachable through this proxy, so we
-  // keep gateway auth disabled to avoid CLI/doctor "unauthorized" issues when
-  // they connect locally without trusted-proxy headers.
-  next.gateway.auth.mode = "none";
+  // ClawNow runs in managed trusted-proxy mode. Keep gateway auth aligned with
+  // control-plane issued trusted-proxy sessions to avoid auth-mode drift.
+  next.gateway.auth.mode = "trusted-proxy";
   next.gateway.auth.trustedProxy = next.gateway.auth.trustedProxy || {};
   next.gateway.auth.trustedProxy.userHeader = "x-forwarded-user";
   next.gateway.auth.trustedProxy.requiredHeaders = [
@@ -497,10 +563,27 @@ function enforceGatewayTrustedProxyConfig(config) {
   delete next.gateway.auth.token;
   delete next.gateway.auth.password;
 
-  next.gateway.trustedProxies = ["127.0.0.1", "::1"];
+  // Keep trusted-proxy traffic distinct from local CLI/tools by using a
+  // different loopback source IP for proxy -> gateway connections.
+  // - proxy connects with localAddress=127.0.0.2 (trusted)
+  // - local tools connect from 127.0.0.1 (not trusted)
+  // Include ::1 to satisfy OpenClaw's bind=loopback trusted-proxy validation.
+  next.gateway.trustedProxies = ["127.0.0.2", "::1"];
   next.gateway.controlUi = next.gateway.controlUi || {};
   next.gateway.controlUi.basePath = next.gateway.controlUi.basePath || config.controlPrefix;
   next.gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback = true;
+  next.update =
+    next.update && typeof next.update === "object" && !Array.isArray(next.update) ? next.update : {};
+  // Platform-managed upgrades: keep VM-side update prompts/auto-updates disabled.
+  next.update.checkOnStart = false;
+  next.update.auto =
+    next.update.auto && typeof next.update.auto === "object" && !Array.isArray(next.update.auto)
+      ? next.update.auto
+      : {};
+  next.update.auto.enabled = false;
+  // ClawNow proxy is the trust boundary; skip browser pairing ceremony so
+  // Control UI connections do not fail on device identity checks.
+  next.gateway.controlUi.dangerouslyDisableDeviceAuth = true;
 
   fs.writeFileSync(configPath, `${JSON.stringify(next, null, 2)}\n`);
   return { configPath };
@@ -536,32 +619,47 @@ async function handleGatewayRepair(req, res, config) {
     return;
   }
 
+  const resetRes = spawnSync("systemctl", ["reset-failed", config.openclawService], {
+    encoding: "utf8",
+    timeout: 6000,
+  });
+  details.resetFailedExitCode =
+    typeof resetRes.status === "number" ? resetRes.status : resetRes.error ? -1 : null;
+
   const restartRes = spawnSync("systemctl", ["restart", config.openclawService], {
     encoding: "utf8",
     timeout: 12_000,
   });
-  if (restartRes.error) {
-    writeHttpError(
-      res,
-      502,
-      "repair_restart_failed",
-      `systemctl restart failed: ${String(restartRes.error?.message || restartRes.error)}`,
-    );
-    return;
-  }
-  if (restartRes.status !== 0) {
-    writeHttpError(
-      res,
-      502,
-      "repair_restart_failed",
-      `systemctl restart exited with ${restartRes.status}: ${(restartRes.stderr || restartRes.stdout || "").trim() || "unknown error"}`,
-    );
-    return;
+  details.restartExitCode =
+    typeof restartRes.status === "number" ? restartRes.status : restartRes.error ? -1 : null;
+
+  if (restartRes.error || restartRes.status !== 0) {
+    const startRes = spawnSync("systemctl", ["start", config.openclawService], {
+      encoding: "utf8",
+      timeout: 12_000,
+    });
+    details.startFallbackExitCode =
+      typeof startRes.status === "number" ? startRes.status : startRes.error ? -1 : null;
+    if (startRes.error || startRes.status !== 0) {
+      const restartMessage = restartRes.error
+        ? String(restartRes.error?.message || restartRes.error)
+        : `${restartRes.status}: ${(restartRes.stderr || restartRes.stdout || "").trim() || "unknown error"}`;
+      const startMessage = startRes.error
+        ? String(startRes.error?.message || startRes.error)
+        : `${startRes.status}: ${(startRes.stderr || startRes.stdout || "").trim() || "unknown error"}`;
+      writeHttpError(
+        res,
+        502,
+        "repair_restart_failed",
+        `systemctl restart/start failed (restart=${restartMessage}; start=${startMessage})`,
+      );
+      return;
+    }
   }
   details.restarted = true;
 
   const openclawTarget = resolveTarget(config.openclawUpstream);
-  const deadline = Date.now() + 15_000;
+  const deadline = Date.now() + 90_000;
   while (Date.now() < deadline) {
     // eslint-disable-next-line no-await-in-loop
     const probe = await checkTcpConnectivity({ ...openclawTarget, timeoutMs: 700 });
@@ -637,10 +735,16 @@ function createProxyConfig() {
     bind: process.env.CLAWNOW_PROXY_BIND?.trim() || "127.0.0.1",
     port: parsePort(process.env.CLAWNOW_PROXY_PORT, 18790),
     sharedSecret,
+    tokenClockSkewSeconds: parsePositiveInt(process.env.CLAWNOW_PROXY_TOKEN_CLOCK_SKEW_SECONDS, 120),
     expectedIss: process.env.CLAWNOW_PROXY_EXPECTED_ISS?.trim() || "clawnow-control-plane",
     expectedAud: process.env.CLAWNOW_PROXY_EXPECTED_AUD?.trim() || "openclaw-gateway",
+    instanceId: process.env.CLAWNOW_INSTANCE_ID?.trim() || "local",
     controlPrefix: normalizePrefix(process.env.CLAWNOW_PROXY_CONTROL_PREFIX, "/clawnow"),
     novncPrefix: normalizePrefix(process.env.CLAWNOW_PROXY_NOVNC_PREFIX, "/novnc"),
+    localGatewayPrefix: normalizePrefix(
+      process.env.CLAWNOW_PROXY_LOCAL_GATEWAY_PREFIX,
+      "/__clawnow/local-gateway",
+    ),
     healthPath: normalizePrefix(process.env.CLAWNOW_PROXY_HEALTH_PATH, "/__clawnow/health"),
     bootstrapPath: normalizePrefix(
       process.env.CLAWNOW_PROXY_BOOTSTRAP_PATH,
@@ -652,6 +756,10 @@ function createProxyConfig() {
     stripControlPrefix: parseBoolean(process.env.CLAWNOW_PROXY_STRIP_CONTROL_PREFIX, false),
     stripNoVncPrefix: parseBoolean(process.env.CLAWNOW_PROXY_STRIP_NOVNC_PREFIX, true),
     openclawUpstream: parseUpstream("CLAWNOW_OPENCLAW_UPSTREAM", "http://127.0.0.1:18789"),
+    openclawLocalAddress: parseLoopbackLocalAddress(
+      process.env.CLAWNOW_OPENCLAW_LOCAL_ADDRESS,
+      "127.0.0.2",
+    ),
     openclawService: process.env.CLAWNOW_OPENCLAW_SERVICE?.trim() || "openclaw-gateway.service",
     novncUpstream: parseUpstream("CLAWNOW_NOVNC_UPSTREAM", "http://127.0.0.1:6080"),
   };
@@ -680,6 +788,19 @@ function resolveRoute(config, pathname) {
       upstream: config.novncUpstream,
     };
   }
+  if (shouldUseRoute(pathname, config.localGatewayPrefix)) {
+    return {
+      kind: "proxy",
+      prefix: config.localGatewayPrefix,
+      stripPrefix: true,
+      expectedSessionType: "control_ui",
+      upstream: config.openclawUpstream,
+      localAddress: config.openclawLocalAddress,
+      // Internal local route for VM-side CLI/agent tools.
+      // Must be direct loopback (no forwarded headers).
+      requireDirectLoopback: true,
+    };
+  }
   if (shouldUseRoute(pathname, config.controlPrefix)) {
     return {
       kind: "proxy",
@@ -687,6 +808,7 @@ function resolveRoute(config, pathname) {
       stripPrefix: config.stripControlPrefix,
       expectedSessionType: "control_ui",
       upstream: config.openclawUpstream,
+      localAddress: config.openclawLocalAddress,
     };
   }
   return { kind: "unknown" };
@@ -707,6 +829,7 @@ function resolveUpgradeRoute(config, pathname) {
       stripPrefix: false,
       expectedSessionType: "control_ui",
       upstream: config.openclawUpstream,
+      localAddress: config.openclawLocalAddress,
     };
   }
   return route;
@@ -726,6 +849,7 @@ function proxyHttpRequest(req, res, route) {
       method: req.method,
       path: targetPath,
       headers,
+      ...(route.localAddress ? { localAddress: route.localAddress } : {}),
     },
     (upstreamRes) => {
       const statusCode = upstreamRes.statusCode || 502;
@@ -772,10 +896,17 @@ function proxyUpgradeRequest(req, socket, head, route) {
 
   const isTls = route.upstream.protocol === "https:";
   const upstreamSocket = isTls
-    ? tls.connect(Number(route.upstream.port || 443), route.upstream.hostname, {
+    ? tls.connect({
+        port: Number(route.upstream.port || 443),
+        host: route.upstream.hostname,
         servername: route.upstream.hostname,
+        ...(route.localAddress ? { localAddress: route.localAddress } : {}),
       })
-    : net.connect(Number(route.upstream.port || 80), route.upstream.hostname);
+    : net.connect({
+        port: Number(route.upstream.port || 80),
+        host: route.upstream.hostname,
+        ...(route.localAddress ? { localAddress: route.localAddress } : {}),
+      });
 
   const cleanup = () => {
     if (!socket.destroyed) {
@@ -848,6 +979,30 @@ function parseAndValidateToken(req, config, expectedSessionType) {
   };
 }
 
+function buildLoopbackClaims(config) {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  return {
+    sub: "loopback@local",
+    iss: config.expectedIss,
+    aud: config.expectedAud,
+    exp: nowSeconds + 3600,
+    iat: nowSeconds,
+    instanceId: config.instanceId || "local",
+    sessionType: "control_ui",
+    token: "__loopback__",
+  };
+}
+
+function resolveRouteAuth(req, config, route) {
+  if (route.requireDirectLoopback === true) {
+    if (!isDirectLoopbackClient(req)) {
+      throw new Error("loopback_only");
+    }
+    return { claims: buildLoopbackClaims(config), source: "loopback" };
+  }
+  return parseAndValidateToken(req, config, route.expectedSessionType);
+}
+
 function createServer(config) {
   const server = http.createServer((req, res) => {
     const requestUrl = new URL(req.url || "/", "http://clawnow.local");
@@ -896,9 +1051,11 @@ function createServer(config) {
     }
 
     try {
-      const auth = parseAndValidateToken(req, config, route.expectedSessionType);
+      const auth = resolveRouteAuth(req, config, route);
       const setCookie =
-        auth.source === "cookie" ? null : buildSessionCookie(auth.claims, route.prefix);
+        auth.source === "cookie" || auth.source === "loopback"
+          ? null
+          : buildSessionCookie(auth.claims, route.prefix);
       proxyHttpRequest(req, res, { ...route, claims: auth.claims, config, setCookie });
     } catch (error) {
       writeHttpError(
@@ -918,7 +1075,7 @@ function createServer(config) {
       return;
     }
     try {
-      const auth = parseAndValidateToken(req, config, route.expectedSessionType);
+      const auth = resolveRouteAuth(req, config, route);
       proxyUpgradeRequest(req, socket, head, { ...route, claims: auth.claims, config });
     } catch (error) {
       writeUpgradeError(socket, 401, `Token validation failed: ${String(error.message || error)}`);
@@ -936,6 +1093,7 @@ function main() {
     console.log(
       `[clawnow-proxy] listening on http://${config.bind}:${config.port}\n` +
         `  control: ${config.controlPrefix} -> ${config.openclawUpstream.toString()}\n` +
+        `  local:   ${config.localGatewayPrefix} (loopback-only) -> ${config.openclawUpstream.toString()}\n` +
         `  novnc:   ${config.novncPrefix} -> ${novncTarget}`,
     );
   });

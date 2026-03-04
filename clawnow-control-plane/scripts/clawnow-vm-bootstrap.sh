@@ -1135,6 +1135,8 @@ cat >/etc/clawnow-proxy.env <<EOF_ENV
 CLAWNOW_PROXY_SHARED_SECRET=${PROXY_SECRET}
 CLAWNOW_PROXY_BIND=${PROXY_BIND}
 CLAWNOW_PROXY_PORT=${PROXY_PORT}
+CLAWNOW_INSTANCE_ID=${INSTANCE_ID}
+CLAWNOW_PROXY_LOCAL_GATEWAY_PREFIX=/__clawnow/local-gateway
 # Keep proxy -> gateway connections distinct from local CLI/tools by binding the
 # proxy upstream socket to a different loopback source IP (trustedProxies=127.0.0.2).
 CLAWNOW_OPENCLAW_UPSTREAM=http://127.0.0.1:${GATEWAY_PORT}
@@ -1195,6 +1197,8 @@ CLAWNOW_CONTROL_UI_ALLOWED_ORIGIN="$CONTROL_UI_ALLOWED_ORIGIN" \
 CLAWNOW_CONTROL_UI_ROOT="$CONTROL_UI_ROOT" \
 CLAWNOW_CONTROL_PLANE_DEVICE_ID="$CONTROL_PLANE_DEVICE_ID" \
 CLAWNOW_CONTROL_PLANE_DEVICE_PUBLIC_KEY="$CONTROL_PLANE_DEVICE_PUBLIC_KEY" \
+CLAWNOW_PROXY_PORT="$PROXY_PORT" \
+CLAWNOW_PROXY_LOCAL_GATEWAY_PREFIX="/__clawnow/local-gateway" \
 node <<'NODE'
 const fs = require('node:fs');
 
@@ -1214,7 +1218,34 @@ if (fs.existsSync(configPath)) {
 }
 
 config.gateway = config.gateway || {};
-config.gateway.mode = config.gateway.mode || 'local';
+const proxyPortRaw = String(process.env.CLAWNOW_PROXY_PORT || '18790').trim();
+const proxyPort = Number.isFinite(Number(proxyPortRaw)) && Number(proxyPortRaw) > 0 ? Number(proxyPortRaw) : 18790;
+const localGatewayPrefixRaw = String(
+  process.env.CLAWNOW_PROXY_LOCAL_GATEWAY_PREFIX || '/__clawnow/local-gateway',
+).trim();
+const localGatewayPrefix = (() => {
+  if (!localGatewayPrefixRaw) {
+    return '/__clawnow/local-gateway';
+  }
+  const normalized = localGatewayPrefixRaw.startsWith('/')
+    ? localGatewayPrefixRaw
+    : `/${localGatewayPrefixRaw}`;
+  return normalized.replace(/\/+$/, '') || '/__clawnow/local-gateway';
+})();
+const localGatewayWsUrl = `ws://127.0.0.1:${proxyPort}${localGatewayPrefix}`;
+
+// VM-local CLI/agent tools should not hit the raw gateway port directly in
+// managed trusted-proxy mode; route them through local proxy with injected
+// trusted-proxy headers.
+config.gateway.mode = 'remote';
+config.gateway.remote =
+  config.gateway.remote && typeof config.gateway.remote === 'object' && !Array.isArray(config.gateway.remote)
+    ? config.gateway.remote
+    : {};
+config.gateway.remote.url = localGatewayWsUrl;
+delete config.gateway.remote.token;
+delete config.gateway.remote.password;
+delete config.gateway.remote.tlsFingerprint;
 // Disable automatic config reload/restart while running the onboarding wizard.
 // The wizard writes config multiple times; hot reload can restart the gateway mid-flow,
 // wiping the in-memory wizard session and forcing users to start over.
