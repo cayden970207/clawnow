@@ -199,7 +199,9 @@ const GATEWAY_CONFIG_PATCH_MAX_ATTEMPTS = 3;
 const GATEWAY_CONFIG_PATCH_RETRY_DELAY_MS = 400;
 const GATEWAY_HEALTH_PATH = "__clawnow/health";
 const GATEWAY_REPAIR_PATH = "__clawnow/repair/gateway";
-const GATEWAY_UPSTREAM_BOOT_TIMEOUT_MS = 7 * 60 * 1000;
+// First boot can be slow (apt + Node + OpenClaw + desktop/browser deps). Avoid
+// marking the VM as errored too early; defer hard failure to provisioningTimeoutSeconds.
+const GATEWAY_UPSTREAM_BOOT_TIMEOUT_MS = 12 * 60 * 1000;
 const GATEWAY_UNVERIFIED_READY_GRACE_MS = 3 * 60 * 1000;
 const GATEWAY_WARMUP_RETRY_WINDOW_MS = 45 * 1000;
 const GATEWAY_WARMUP_RETRY_BACKOFF_BASE_MS = 1000;
@@ -219,6 +221,8 @@ const OPENAI_CODEX_OAUTH_ORIGINATOR = "pi";
 const OPENAI_CODEX_OAUTH_SESSION_TTL_MS = 30 * 60 * 1000;
 const OPENAI_MEMORY_EMBED_MODEL = "text-embedding-3-small";
 const CLAWNOW_DEFAULT_OPENCLAW_VERSION = "2026.2.23";
+const CLAWNOW_DEFAULT_CONTROL_SESSION_TTL_SECONDS = 2 * 60 * 60;
+const CLAWNOW_MIN_CONTROL_SESSION_TTL_SECONDS = 30 * 60;
 const CLAWNOW_DEFAULT_CHANNEL_IDS = ["telegram", "whatsapp"] as const;
 const DEFAULT_MAIN_SESSION_KEY = "main";
 const DEFAULT_BOOTSTRAP_SCRIPT_URL =
@@ -479,6 +483,13 @@ function loadClawNowConfig(): ClawNowConfig {
     );
   }
 
+  const controlSessionTtlSeconds = Math.max(
+    CLAWNOW_MIN_CONTROL_SESSION_TTL_SECONDS,
+    Math.floor(
+      getNumberEnv("CLAWNOW_CONTROL_SESSION_TTL_SECONDS", CLAWNOW_DEFAULT_CONTROL_SESSION_TTL_SECONDS),
+    ),
+  );
+
   return {
     hetznerApiToken: getRequiredEnv("CLAWNOW_HETZNER_API_TOKEN"),
     hetznerLocation: getOptionalEnv("CLAWNOW_HETZNER_LOCATION") || "sin",
@@ -504,7 +515,7 @@ function loadClawNowConfig(): ClawNowConfig {
     ),
     controlUiAllowedOrigin: resolveControlUiAllowedOrigin(),
     proxySharedSecret: getRequiredEnv("CLAWNOW_PROXY_SHARED_SECRET"),
-    controlSessionTtlSeconds: getNumberEnv("CLAWNOW_CONTROL_SESSION_TTL_SECONDS", 300),
+    controlSessionTtlSeconds,
     novncSessionTtlMinutes: getNumberEnv("CLAWNOW_NOVNC_TTL_MINUTES", 30),
     provisioningTimeoutSeconds: getNumberEnv(
       "CLAWNOW_PROVISIONING_TIMEOUT_SECONDS",
@@ -732,11 +743,15 @@ export class ClawNowService {
     }
   }
 
-  async provisionUserInstance(userId: string): Promise<{
+  async provisionUserInstance(
+    userId: string,
+    options?: { organizationId?: string | null },
+  ): Promise<{
     instance: ClawInstance;
     created: boolean;
     reused: boolean;
   }> {
+    const selectedOrganizationId = options?.organizationId?.trim() || null;
     let instance = await this.findInstanceByUserId(userId);
     let forceProvision = false;
 
@@ -772,7 +787,11 @@ export class ClawNowService {
             }
           }
 
-          instance = await this.resetInstanceForProvisioning(instance, userId);
+          instance = await this.resetInstanceForProvisioning(
+            instance,
+            userId,
+            selectedOrganizationId,
+          );
           forceProvision = true;
         } else {
           const provisionedAtPatch =
@@ -817,9 +836,9 @@ export class ClawNowService {
     }
 
     if (!instance) {
-      instance = await this.createSeedInstance(userId);
+      instance = await this.createSeedInstance(userId, selectedOrganizationId);
     } else if (!forceProvision) {
-      instance = await this.resetInstanceForProvisioning(instance, userId);
+      instance = await this.resetInstanceForProvisioning(instance, userId, selectedOrganizationId);
     }
 
     await this.logEvent(
@@ -2295,7 +2314,10 @@ export class ClawNowService {
     };
   }
 
-  private async createSeedInstance(userId: string): Promise<ClawInstance> {
+  private async createSeedInstance(
+    userId: string,
+    selectedOrganizationId?: string | null,
+  ): Promise<ClawInstance> {
     const now = new Date().toISOString();
     const { data, error } = await supabaseAdmin
       .from("claw_instances")
@@ -2308,7 +2330,7 @@ export class ClawNowService {
         server_name: this.buildServerName(userId),
         status: "provisioning",
         provisioning_started_at: now,
-        metadata: this.buildProvisioningMetadata(),
+        metadata: this.buildProvisioningMetadata(undefined, selectedOrganizationId),
         gateway_url: null,
         control_ui_url: null,
         novnc_url: null,
@@ -2392,6 +2414,7 @@ export class ClawNowService {
   private async resetInstanceForProvisioning(
     instance: ClawInstance,
     userId: string,
+    selectedOrganizationId?: string | null,
   ): Promise<ClawInstance> {
     const { data, error } = await supabaseAdmin
       .from("claw_instances")
@@ -2412,7 +2435,7 @@ export class ClawNowService {
         provisioned_at: null,
         last_heartbeat_at: null,
         novnc_enabled_until: null,
-        metadata: this.buildProvisioningMetadata(instance.metadata),
+        metadata: this.buildProvisioningMetadata(instance.metadata, selectedOrganizationId),
       })
       .eq("id", instance.id)
       .select("*")
@@ -3220,14 +3243,21 @@ export class ClawNowService {
     );
   }
 
-  private buildProvisioningMetadata(existing?: Record<string, unknown>): Record<string, unknown> {
-    return {
+  private buildProvisioningMetadata(
+    existing?: Record<string, unknown>,
+    selectedOrganizationId?: string | null,
+  ): Record<string, unknown> {
+    const metadata: Record<string, unknown> = {
       ...existing,
       trusted_proxy_mode: "trusted-proxy",
       onboarding_completed: false,
       onboarding_completed_at: null,
       onboarding_last_status: "pending",
     };
+    if (typeof selectedOrganizationId === "string" && selectedOrganizationId.trim().length > 0) {
+      metadata.billing_organization_id = selectedOrganizationId.trim();
+    }
+    return metadata;
   }
 
   private isTerminalOnboardingCompleted(instance: ClawInstance): boolean {
@@ -4575,8 +4605,22 @@ runcmd:
     const noVncPrefix = `/${this.config.novncPath}`;
     const usePublicHttpGateway = this.usesPublicHttpGatewayTemplate();
     const proxyBind = usePublicHttpGateway ? "0.0.0.0" : "127.0.0.1";
+    // Cache-bust bootstrap assets so newly provisioned VMs never pick up a stale script
+    // from CDN caches right after a control-plane deploy.
+    const withCacheBust = (raw: string): string => {
+      try {
+        const url = new URL(raw);
+        url.searchParams.set("v", instanceId);
+        return url.toString();
+      } catch {
+        return raw;
+      }
+    };
+    const bootstrapScriptUrlWithBust = withCacheBust(bootstrapScriptUrl);
+    const proxyScriptUrlWithBust = withCacheBust(proxyScriptUrl);
+    const controlUiUpdaterScriptUrlWithBust = withCacheBust(controlUiUpdaterScriptUrl);
     return [
-      `curl -fsSL ${bootstrapScriptUrl}`,
+      `curl -fsSL ${bootstrapScriptUrlWithBust}`,
       "| bash -s --",
       `--proxy-secret '${this.config.proxySharedSecret}'`,
       `--proxy-bind ${proxyBind}`,
@@ -4591,11 +4635,11 @@ runcmd:
       ...(this.config.controlUiAllowedOrigin
         ? [`--control-ui-origin '${this.config.controlUiAllowedOrigin}'`]
         : []),
-      `--proxy-script-url '${proxyScriptUrl}'`,
+      `--proxy-script-url '${proxyScriptUrlWithBust}'`,
       ...(this.config.controlUiManifestUrl
         ? [
             `--control-ui-manifest-url '${this.config.controlUiManifestUrl}'`,
-            `--control-ui-updater-script-url '${controlUiUpdaterScriptUrl}'`,
+            `--control-ui-updater-script-url '${controlUiUpdaterScriptUrlWithBust}'`,
           ]
         : []),
       ...(this.config.openClawVersion

@@ -53,7 +53,7 @@ SERVER_ID=""
 GATEWAY_ORIGIN_TEMPLATE=""
 CONTROL_UI_ORIGIN=""
 ENABLE_HTTPS="1"
-OPENCLAW_VERSION="latest"
+OPENCLAW_VERSION="2026.2.23"
 PROXY_SCRIPT_URL="https://raw.githubusercontent.com/openclaw/openclaw/main/scripts/clawnow-proxy.mjs"
 CONTROL_UI_MANIFEST_URL=""
 CONTROL_UI_UPDATER_SCRIPT_URL="https://raw.githubusercontent.com/openclaw/openclaw/main/clawnow-control-plane/scripts/clawnow-control-ui-updater.sh"
@@ -243,6 +243,277 @@ wait_for_tcp_port() {
   return 1
 }
 
+log_unit_diagnostics() {
+  local unit="$1"
+  log_step "systemctl status ${unit}"
+  systemctl --no-pager --full status "$unit" || true
+  log_step "journalctl -u ${unit} (last 120 lines)"
+  journalctl -u "$unit" -n 120 --no-pager || true
+}
+
+ensure_service_active() {
+  local unit="$1"
+  local attempts="${2:-4}"
+  local delay_seconds="${3:-2}"
+  local attempt
+
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+    if systemctl restart "$unit" >/dev/null 2>&1 && systemctl is-active --quiet "$unit"; then
+      log_step "${unit} is active (attempt ${attempt}/${attempts})"
+      return 0
+    fi
+    log_step "warning: ${unit} failed to become active on attempt ${attempt}/${attempts}"
+    sleep "$delay_seconds"
+  done
+
+  log_step "error: ${unit} did not become active after ${attempts} attempts"
+  log_unit_diagnostics "$unit"
+  return 1
+}
+
+ensure_port_ready_for_service() {
+  local host="$1"
+  local port="$2"
+  local service="$3"
+  local label="$4"
+  local retries="${5:-120}"
+  local delay_seconds="${6:-1}"
+
+  if wait_for_tcp_port "$host" "$port" "$retries" "$delay_seconds"; then
+    return 0
+  fi
+
+  log_step "warning: ${label} port ${host}:${port} not ready; attempting ${service} recovery"
+  systemctl reset-failed "$service" >/dev/null 2>&1 || true
+  if ! (systemctl restart "$service" >/dev/null 2>&1 || systemctl start "$service" >/dev/null 2>&1); then
+    log_step "warning: failed to restart/start ${service} during port recovery"
+  fi
+  if wait_for_tcp_port "$host" "$port" "$retries" "$delay_seconds"; then
+    log_step "${label} port ${host}:${port} recovered after ${service} restart"
+    return 0
+  fi
+
+  log_step "error: ${label} port ${host}:${port} did not become ready"
+  log_unit_diagnostics "$service"
+  return 1
+}
+
+run_browser_prewarm_once() {
+  local profile="$1"
+  local log_file="$2"
+
+  if command -v timeout >/dev/null 2>&1; then
+    OPENCLAW_MANAGED_TRUSTED_PROXY=1 DISPLAY="${DESKTOP_DISPLAY}" \
+      timeout 120 openclaw browser start --browser-profile "$profile" --json >>"$log_file" 2>&1
+    return $?
+  fi
+
+  OPENCLAW_MANAGED_TRUSTED_PROXY=1 DISPLAY="${DESKTOP_DISPLAY}" \
+    openclaw browser start --browser-profile "$profile" --json >>"$log_file" 2>&1
+}
+
+prewarm_browser_profile() {
+  local profile="${1:-openclaw}"
+  local attempts="${2:-4}"
+  local delay_seconds="${3:-4}"
+  local log_file="/var/log/clawnow-browser-prewarm.log"
+  local attempt
+
+  : >"$log_file"
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    log_step "browser prewarm attempt ${attempt}/${attempts} (profile=${profile})"
+    if run_browser_prewarm_once "$profile" "$log_file"; then
+      log_step "browser prewarm succeeded (profile=${profile})"
+      return 0
+    fi
+
+    log_step "browser prewarm attempt ${attempt} failed; restarting desktop before retry"
+    systemctl restart clawnow-desktop.service >/dev/null 2>&1 || true
+    if ! systemctl is-active --quiet openclaw-gateway.service; then
+      log_step "gateway became inactive during prewarm; attempting recovery"
+      ensure_service_active openclaw-gateway.service 2 2 || true
+    fi
+    wait_for_tcp_port 127.0.0.1 "$GATEWAY_PORT" 20 1 || true
+    sleep "$delay_seconds"
+  done
+
+  log_step "warning: browser prewarm failed after ${attempts} attempts (see ${log_file})"
+  tail -n 80 "$log_file" || true
+  return 1
+}
+
+apply_openclaw_managed_proxy_local_auth_hotfix() {
+  local npm_root package_root dist_dir
+  npm_root="$(npm root -g 2>/dev/null || true)"
+  package_root="${npm_root}/openclaw"
+  dist_dir="${package_root}/dist"
+
+  if [[ -z "$npm_root" || ! -d "$dist_dir" ]]; then
+    log_step "warning: unable to locate openclaw dist for managed trusted-proxy hotfix"
+    return 0
+  fi
+
+  OPENCLAW_DIST_DIR="$dist_dir" node <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+
+const distDir = String(process.env.OPENCLAW_DIST_DIR || "").trim();
+if (!distDir) {
+  process.exit(0);
+}
+
+const files = fs
+  .readdirSync(distDir, { withFileTypes: true })
+  .filter((entry) => entry.isFile() && entry.name.endsWith(".js"))
+  .map((entry) => path.join(distDir, entry.name));
+
+if (files.length === 0) {
+  process.exit(0);
+}
+
+const trustedProxyDefaultsNeedle =
+  'const MANAGED_TRUSTED_PROXY_DEFAULT_TRUSTED_PROXIES = ["127.0.0.1", "::1"];';
+const trustedProxyDefaultsReplacement =
+  'const MANAGED_TRUSTED_PROXY_DEFAULT_TRUSTED_PROXIES = ["127.0.0.2", "::1"];';
+const marker = "if (!hasForwarded && isLoopbackAddress(req.socket?.remoteAddress ?? \"\")) return true;";
+const oldGuardPattern =
+  /function isLocalDirectRequest\([^)]*\)\s*\{[\s\S]*?return isLocalishHost\(req\.headers\?\.host\)\s*&&\s*\(!hasForwarded\s*\|\|\s*remoteIsTrustedProxy\);\s*\}/m;
+const replacement = [
+  "function isLocalDirectRequest(req, trustedProxies, allowRealIpFallback = false) {",
+  "\tif (!req) return false;",
+  "\tconst hostIsLocal = isLocalishHost(req.headers?.host);",
+  "\tif (!hostIsLocal) return false;",
+  "\tconst hasForwarded = Boolean(req.headers?.[\"x-forwarded-for\"] || req.headers?.[\"x-real-ip\"] || req.headers?.[\"x-forwarded-host\"]);",
+  "\tif (!hasForwarded && isLoopbackAddress(req.socket?.remoteAddress ?? \"\")) return true;",
+  "\tif (!isLoopbackAddress(resolveRequestClientIp(req, trustedProxies, allowRealIpFallback) ?? \"\")) return false;",
+  "\tconst remoteIsTrustedProxy = isTrustedProxyAddress(req.socket?.remoteAddress, trustedProxies);",
+  "\treturn !hasForwarded || remoteIsTrustedProxy;",
+  "}",
+].join("\n");
+const envGateNeedleInline = "if (isManagedTrustedProxyEnabled(env) && localDirect) return {";
+const envGateNeedleBlock = "if (isManagedTrustedProxyEnabled(env) && localDirect) {";
+
+function countOccurrences(source, needle) {
+  if (!needle) {
+    return 0;
+  }
+  let index = 0;
+  let count = 0;
+  while (true) {
+    const found = source.indexOf(needle, index);
+    if (found === -1) {
+      return count;
+    }
+    count += 1;
+    index = found + needle.length;
+  }
+}
+
+let inspectedCount = 0;
+let patchedCount = 0;
+let alreadyPatchedCount = 0;
+let envGatePatchedCount = 0;
+let trustedProxyDefaultsPatchedCount = 0;
+for (const filePath of files) {
+  const original = fs.readFileSync(filePath, "utf8");
+  if (!original.includes("function isLocalDirectRequest(") && !original.includes("MANAGED_TRUSTED_PROXY_DEFAULT_TRUSTED_PROXIES")) {
+    continue;
+  }
+  inspectedCount += 1;
+  let updated = original;
+
+  // Ensure the managed trusted-proxy default trusted proxy list matches ClawNow:
+  // - clawnow-proxy connects with localAddress=127.0.0.2
+  // - local CLI/tools connect from 127.0.0.1 and should NOT be treated as a proxy.
+  if (updated.includes(trustedProxyDefaultsNeedle)) {
+    updated = updated.replaceAll(trustedProxyDefaultsNeedle, trustedProxyDefaultsReplacement);
+    trustedProxyDefaultsPatchedCount += 1;
+  }
+
+  if (!original.includes(marker)) {
+    if (oldGuardPattern.test(updated)) {
+      updated = updated.replace(oldGuardPattern, replacement);
+    } else if (
+      updated.includes(
+        "if (!isLoopbackAddress(resolveRequestClientIp(req, trustedProxies, allowRealIpFallback) ?? \"\")) return false;",
+      ) &&
+      updated.includes(
+        "return isLocalishHost(req.headers?.host) && (!hasForwarded || remoteIsTrustedProxy);",
+      )
+    ) {
+      updated = updated
+        .replace(
+          "if (!req) return false;",
+          "if (!req) return false;\n\tconst hostIsLocal = isLocalishHost(req.headers?.host);\n\tif (!hostIsLocal) return false;\n\tconst hasForwarded = Boolean(req.headers?.[\"x-forwarded-for\"] || req.headers?.[\"x-real-ip\"] || req.headers?.[\"x-forwarded-host\"]);\n\tif (!hasForwarded && isLoopbackAddress(req.socket?.remoteAddress ?? \"\")) return true;",
+        )
+        .replace(
+          "return isLocalishHost(req.headers?.host) && (!hasForwarded || remoteIsTrustedProxy);",
+          "return !hasForwarded || remoteIsTrustedProxy;",
+        );
+    }
+  } else {
+    alreadyPatchedCount += 1;
+  }
+
+  const envInlineHits = countOccurrences(updated, envGateNeedleInline);
+  const envBlockHits = countOccurrences(updated, envGateNeedleBlock);
+  if (envInlineHits > 0) {
+    updated = updated.replaceAll(envGateNeedleInline, "if (localDirect) return {");
+  }
+  if (envBlockHits > 0) {
+    updated = updated.replaceAll(envGateNeedleBlock, "if (localDirect) {");
+  }
+  envGatePatchedCount += envInlineHits + envBlockHits;
+
+  if (updated !== original) {
+    fs.writeFileSync(filePath, updated);
+    patchedCount += 1;
+  }
+}
+
+if (patchedCount > 0) {
+  console.log(`[clawnow-bootstrap] applied managed trusted-proxy local auth hotfix to ${patchedCount} bundle(s)`);
+}
+if (inspectedCount > 0 && patchedCount === 0 && alreadyPatchedCount === 0) {
+  console.log(
+    "[clawnow-bootstrap] warning: managed trusted-proxy local auth hotfix did not match installed bundle",
+  );
+}
+if (inspectedCount > 0) {
+  console.log(
+    `[clawnow-bootstrap] managed trusted-proxy local auth hotfix inspected=${inspectedCount} patched=${patchedCount} already=${alreadyPatchedCount} envGatePatched=${envGatePatchedCount} trustedProxyDefaultsPatched=${trustedProxyDefaultsPatchedCount}`,
+  );
+}
+NODE
+}
+
+verify_gateway_local_rpc() {
+  local attempts="${1:-18}"
+  local delay_seconds="${2:-2}"
+  local attempt
+
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if OPENCLAW_MANAGED_TRUSTED_PROXY=1 openclaw gateway probe --json --timeout 5000 >/tmp/clawnow-gateway-probe.json 2>/tmp/clawnow-gateway-probe.err; then
+      log_step "gateway RPC probe ok"
+      return 0
+    fi
+
+    # Keep logs concise but actionable.
+    local err_tail=""
+    err_tail="$(tail -n 4 /tmp/clawnow-gateway-probe.err 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]\\{1,\\}/ /g' || true)"
+    log_step "warning: gateway RPC probe failed (attempt ${attempt}/${attempts})${err_tail:+: ${err_tail}}"
+    sleep "$delay_seconds"
+  done
+
+  log_step "error: gateway RPC probe never succeeded"
+  log_step "gateway probe stderr (last 80 lines):"
+  tail -n 80 /tmp/clawnow-gateway-probe.err 2>/dev/null || true
+  log_step "gateway probe json:"
+  cat /tmp/clawnow-gateway-probe.json 2>/dev/null || true
+  return 1
+}
+
 resolve_gateway_origin_from_template() {
   local template="$1"
   local ipv4="$2"
@@ -371,11 +642,83 @@ install_desktop_runtime_packages() {
   apt-get install -y xvfb x11vnc novnc python3-websockify
 }
 
+configure_system_locale() {
+  log_step "configuring locale to en_US.UTF-8"
+  if [[ -f /etc/locale.gen ]]; then
+    sed -i -E 's/^#\s*(en_US\.UTF-8 UTF-8)/\1/' /etc/locale.gen || true
+  fi
+  if command -v locale-gen >/dev/null 2>&1; then
+    locale-gen en_US.UTF-8 >/dev/null 2>&1 || true
+  fi
+  if command -v update-locale >/dev/null 2>&1; then
+    update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 LANGUAGE=en_US:en >/dev/null 2>&1 || true
+  fi
+  export LANG="en_US.UTF-8"
+  export LC_ALL="en_US.UTF-8"
+  export LANGUAGE="en_US:en"
+}
+
+enforce_browser_locale_preferences() {
+  local prefs_path="/root/.openclaw/browser/openclaw/user-data/Default/Preferences"
+  local local_state_path="/root/.openclaw/browser/openclaw/user-data/Local State"
+  if ! command -v node >/dev/null 2>&1; then
+    return 0
+  fi
+
+  node - "$prefs_path" "$local_state_path" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+
+const prefsPath = process.argv[2];
+const localStatePath = process.argv[3];
+
+const readJsonObject = (filePath) => {
+  try {
+    if (!fs.existsSync(filePath)) {
+      return {};
+    }
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    return parsed;
+  } catch {
+    return {};
+  }
+};
+
+const writeJsonObject = (filePath, value) => {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+};
+
+const setDeep = (root, keys, value) => {
+  let node = root;
+  for (const key of keys.slice(0, -1)) {
+    const next = node[key];
+    if (!next || typeof next !== "object" || Array.isArray(next)) {
+      node[key] = {};
+    }
+    node = node[key];
+  }
+  node[keys[keys.length - 1]] = value;
+};
+
+const prefs = readJsonObject(prefsPath);
+setDeep(prefs, ["intl", "accept_languages"], "en-US,en");
+setDeep(prefs, ["translate", "enabled"], false);
+writeJsonObject(prefsPath, prefs);
+
+const localState = readJsonObject(localStatePath);
+setDeep(localState, ["intl", "app_locale"], "en-US");
+writeJsonObject(localStatePath, localState);
+NODE
+}
+
 prepare_novnc_web_root() {
   local source_root="/usr/share/novnc"
   local target_root="/opt/clawnow/novnc"
-  local error_handler_path="${target_root}/app/error-handler.js"
-  local filter_script_path="${target_root}/clawnow-error-filter.js"
+  local active_root="$source_root"
   DESKTOP_NOVNC_WEB_ROOT="$source_root"
 
   if [[ ! -d "$source_root" ]]; then
@@ -385,10 +728,15 @@ prepare_novnc_web_root() {
 
   rm -rf "$target_root"
   if ! cp -a "$source_root" "$target_root"; then
-    log_step "warning: failed to clone noVNC web root into ${target_root}; using distro root"
-    return 0
+    log_step "warning: failed to clone noVNC web root into ${target_root}; patching distro root directly"
+    active_root="$source_root"
+  else
+    active_root="$target_root"
+    DESKTOP_NOVNC_WEB_ROOT="$target_root"
   fi
-  DESKTOP_NOVNC_WEB_ROOT="$target_root"
+
+  local error_handler_path="${active_root}/app/error-handler.js"
+  local filter_script_path="${active_root}/clawnow-error-filter.js"
 
   if [[ ! -f "$error_handler_path" ]]; then
     log_step "warning: noVNC error handler missing at ${error_handler_path}; continuing without extension filter patch"
@@ -413,12 +761,49 @@ prepare_novnc_web_root() {
     return (
       /Cannot redefine property:\s*(ethereum|solana)/i.test(message) ||
       /Cannot assign to read only property\s+['"]?(ethereum|solana)['"]?/i.test(message) ||
-      /Cannot set property\s+['"]?(chainId|ethereum|solana)['"]?.*only a getter/i.test(message)
+      /Cannot set property\s+['"]?(chainId|ethereum|solana)['"]?.*only a getter/i.test(message) ||
+      /Cannot set properties? of .*?(chainId|ethereum|solana)/i.test(message)
     );
   };
+  const isLikelyChainIdGetterIssue = (value) =>
+    /Cannot set property\s+['"]?chainId['"]?.*only a getter/i.test(String(value ?? ""));
 
   const isExtensionLocation = (value) =>
     /(chrome|moz)-extension:\/\/|safari-web-extension:\/\//i.test(String(value ?? ""));
+
+  const shouldIgnore = (message, locationHint) => {
+    if (!knownMessage(message)) {
+      return false;
+    }
+    if (isExtensionLocation(locationHint)) {
+      return true;
+    }
+    // Some extension stacks are stripped by the browser/runtime; treat this
+    // specific chainId getter mutation error as extension-noise by default.
+    return isLikelyChainIdGetterIssue(message);
+  };
+
+  const hideKnownNoVncErrorPanels = () => {
+    if (typeof document === "undefined") {
+      return;
+    }
+    const nodes = document.querySelectorAll("div, section, pre");
+    for (const node of nodes) {
+      const text = String(node.textContent ?? "").trim();
+      if (!text || text.length > 5000) {
+        continue;
+      }
+      if (!/novnc encountered an error/i.test(text)) {
+        continue;
+      }
+      if (!knownMessage(text)) {
+        continue;
+      }
+      const panel = node.closest("div, section") || node;
+      panel.style.display = "none";
+      panel.setAttribute("data-clawnow-hidden-error", "1");
+    }
+  };
 
   window.addEventListener(
     "error",
@@ -427,7 +812,7 @@ prepare_novnc_web_root() {
       const stack = String(event?.error?.stack ?? "");
       const filename = String(event?.filename ?? "");
       const locationHint = `${filename} ${stack}`;
-      if (!knownMessage(message) || !isExtensionLocation(locationHint)) {
+      if (!shouldIgnore(message, locationHint)) {
         return;
       }
       event.preventDefault();
@@ -442,7 +827,7 @@ prepare_novnc_web_root() {
       const reason = event?.reason;
       const message = String(reason?.message ?? reason ?? "").trim();
       const stack = String(reason?.stack ?? "");
-      if (!knownMessage(message) || !isExtensionLocation(stack)) {
+      if (!shouldIgnore(message, stack)) {
         return;
       }
       event.preventDefault();
@@ -450,11 +835,19 @@ prepare_novnc_web_root() {
     },
     true,
   );
+
+  if (typeof MutationObserver === "function") {
+    const observer = new MutationObserver(() => {
+      hideKnownNoVncErrorPanels();
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+  }
+  hideKnownNoVncErrorPanels();
 })();
 EOF_FILTER_JS
 
   if command -v python3 >/dev/null 2>&1; then
-    python3 - "$target_root" <<'PY'
+    python3 - "$active_root" <<'PY'
 import pathlib
 import re
 import sys
@@ -489,7 +882,7 @@ const fs = require("node:fs");
 
 const filePath = process.argv[2];
 let source = fs.readFileSync(filePath, "utf8");
-if (source.includes("CLAWNOW_EXTENSION_ERROR_FILTER")) {
+if (source.includes("CLAWNOW_EXTENSION_ERROR_FILTER_V3")) {
   process.exit(0);
 }
 
@@ -498,15 +891,23 @@ if (!source.includes(marker)) {
   throw new Error("noVNC error handler marker not found");
 }
 
+// Upgrade path: replace any previous injected filter block.
+source = source.replace(
+  /function shouldIgnoreKnownExtensionInjectionErrors\(event, err\) \{[\s\S]*?\/\/ CLAWNOW_EXTENSION_ERROR_FILTER(?:_V2|_V3)?\n/m,
+  "",
+);
+
 const injectedGuard = `function shouldIgnoreKnownExtensionInjectionErrors(event, err) {
-    const message = String(event?.message ?? err?.message ?? "").trim();
+    const message = String(event?.message ?? err?.message ?? err ?? "").trim();
     if (!message) {
         return false;
     }
     const knownMessage =
         /Cannot redefine property:\\s*(ethereum|solana)/i.test(message) ||
         /Cannot assign to read only property\\s+['"]?(ethereum|solana)['"]?/i.test(message) ||
-        /Cannot set property\\s+['"]?(chainId|ethereum|solana)['"]?.*only a getter/i.test(message);
+        /Cannot set property\\s+['"]?(chainId|ethereum|solana)['"]?.*only a getter/i.test(message) ||
+        /Cannot set properties? of .*?(chainId|ethereum|solana)/i.test(message);
+    const chainIdGetterIssue = /Cannot set property\\s+['"]?chainId['"]?.*only a getter/i.test(message);
     if (!knownMessage) {
         return false;
     }
@@ -518,15 +919,18 @@ const injectedGuard = `function shouldIgnoreKnownExtensionInjectionErrors(event,
         .filter(Boolean)
         .join(" ");
 
-    return /(chrome|moz)-extension:\\/\\//i.test(locationHint);
+    if (/(chrome|moz)-extension:\\/\\//i.test(locationHint)) {
+        return true;
+    }
+    return chainIdGetterIssue;
 }
 
-// CLAWNOW_EXTENSION_ERROR_FILTER
+// CLAWNOW_EXTENSION_ERROR_FILTER_V3
 `;
 
 source = source.replace(marker, `${injectedGuard}${marker}`);
 source = source.replace(
-  "function handleError(event, err) {\n",
+  /function handleError\(event, err\) \{\n(?:\s*if \(shouldIgnoreKnownExtensionInjectionErrors\(event, err\)\) \{\n\s*return false;\n\s*\}\n)?/,
   `function handleError(event, err) {\n    if (shouldIgnoreKnownExtensionInjectionErrors(event, err)) {\n        return false;\n    }\n`,
 );
 
@@ -592,12 +996,15 @@ exit 1
 EOF_DESKTOP_SCRIPT
   chmod +x /opt/clawnow/clawnow-desktop-runtime.sh
 
-  cat >/etc/clawnow-desktop.env <<EOF_DESKTOP_ENV
+cat >/etc/clawnow-desktop.env <<EOF_DESKTOP_ENV
 CLAWNOW_DESKTOP_DISPLAY=${DESKTOP_DISPLAY}
 CLAWNOW_DESKTOP_VNC_PORT=${DESKTOP_VNC_PORT}
 CLAWNOW_DESKTOP_NOVNC_PORT=${DESKTOP_NOVNC_PORT}
 CLAWNOW_DESKTOP_SCREEN=1600x1000x24
 CLAWNOW_DESKTOP_NOVNC_WEB_ROOT=${DESKTOP_NOVNC_WEB_ROOT}
+LANG=en_US.UTF-8
+LC_ALL=en_US.UTF-8
+LANGUAGE=en_US:en
 EOF_DESKTOP_ENV
 }
 
@@ -643,7 +1050,8 @@ fi
 write_state "packages" "running" "installing base packages"
 log_step "installing base packages"
 apt-get update
-apt-get install -y curl ca-certificates gnupg
+apt-get install -y curl ca-certificates gnupg lsof locales
+configure_system_locale
 
 write_state "packages" "running" "installing desktop runtime packages"
 log_step "installing desktop runtime packages"
@@ -665,11 +1073,19 @@ fi
 write_state "packages" "running" "installing openclaw"
 log_step "installing openclaw@${OPENCLAW_VERSION}"
 npm install -g "openclaw@${OPENCLAW_VERSION}"
+log_step "applying managed trusted-proxy local auth hotfix (if needed)"
+apply_openclaw_managed_proxy_local_auth_hotfix
 OPENCLAW_INSTALLED_VERSION="$(openclaw --version 2>/dev/null | head -n 1 | tr -d '[:space:]')"
 if [[ -z "$OPENCLAW_INSTALLED_VERSION" ]]; then
   OPENCLAW_INSTALLED_VERSION="$OPENCLAW_VERSION"
 fi
 log_step "resolved openclaw version: ${OPENCLAW_INSTALLED_VERSION}"
+OPENCLAW_BIN_PATH="$(command -v openclaw || true)"
+if [[ -z "$OPENCLAW_BIN_PATH" ]]; then
+  echo "openclaw binary is not on PATH after npm install -g openclaw@${OPENCLAW_VERSION}" >&2
+  exit 1
+fi
+log_step "resolved openclaw binary: ${OPENCLAW_BIN_PATH}"
 
 write_state "packages" "running" "installing browser"
 log_step "ensuring a supported browser is installed"
@@ -719,7 +1135,10 @@ cat >/etc/clawnow-proxy.env <<EOF_ENV
 CLAWNOW_PROXY_SHARED_SECRET=${PROXY_SECRET}
 CLAWNOW_PROXY_BIND=${PROXY_BIND}
 CLAWNOW_PROXY_PORT=${PROXY_PORT}
+# Keep proxy -> gateway connections distinct from local CLI/tools by binding the
+# proxy upstream socket to a different loopback source IP (trustedProxies=127.0.0.2).
 CLAWNOW_OPENCLAW_UPSTREAM=http://127.0.0.1:${GATEWAY_PORT}
+CLAWNOW_OPENCLAW_LOCAL_ADDRESS=127.0.0.2
 CLAWNOW_NOVNC_UPSTREAM=http://127.0.0.1:${DESKTOP_NOVNC_PORT}
 CLAWNOW_PROXY_CONTROL_PREFIX=${CONTROL_PREFIX}
 CLAWNOW_PROXY_NOVNC_PREFIX=${NOVNC_PREFIX}
@@ -760,7 +1179,12 @@ fi
 cat >/etc/openclaw-gateway.env <<EOF_GATEWAY_ENV
 OPENCLAW_VERSION=${OPENCLAW_INSTALLED_VERSION}
 OPENCLAW_SERVICE_VERSION=${OPENCLAW_INSTALLED_VERSION}
+OPENCLAW_BIN_PATH=${OPENCLAW_BIN_PATH}
 DISPLAY=${DESKTOP_DISPLAY}
+OPENCLAW_MANAGED_TRUSTED_PROXY=1
+LANG=en_US.UTF-8
+LC_ALL=en_US.UTF-8
+LANGUAGE=en_US:en
 EOF_GATEWAY_ENV
 
 write_state "gateway_config" "running" "writing OpenClaw gateway config"
@@ -797,25 +1221,47 @@ config.gateway.mode = config.gateway.mode || 'local';
 	config.gateway.reload = config.gateway.reload || {};
 	config.gateway.reload.mode = 'off';
 	config.gateway.auth = config.gateway.auth || {};
-	// Gateway binds to loopback and is only reachable through the local ClawNow proxy.
-	// Use "none" here so local CLI/doctor/browser probes can connect directly without
-	// needing trusted-proxy headers (the proxy already enforces session auth).
-	config.gateway.auth.mode = 'none';
+	// ClawNow is a managed trusted-proxy deployment. Keep gateway auth in
+	// trusted-proxy mode so operator connections can be treated as shared-auth
+	// (required by Control UI bypass logic when device pairing is disabled).
+	config.gateway.auth.mode = 'trusted-proxy';
 	config.gateway.auth.trustedProxy = config.gateway.auth.trustedProxy || {};
 	config.gateway.auth.trustedProxy.userHeader = 'x-forwarded-user';
-	config.gateway.auth.trustedProxy.requiredHeaders = [
-	  'x-clawnow-verified',
-  'x-clawnow-instance-id',
-  'x-clawnow-session-type',
+config.gateway.auth.trustedProxy.requiredHeaders = [
+		  'x-clawnow-verified',
+	  'x-clawnow-instance-id',
+	  'x-clawnow-session-type',
 ];
-config.gateway.trustedProxies = ['127.0.0.1', '::1'];
+// Keep trusted-proxy traffic distinct from local CLI/tools:
+// - proxy connects with localAddress=127.0.0.2 (trusted)
+// - local tools connect from 127.0.0.1 (not trusted)
+// Include ::1 to satisfy OpenClaw's bind=loopback trusted-proxy validation.
+config.gateway.trustedProxies = ['127.0.0.2', '::1'];
 config.gateway.controlUi = config.gateway.controlUi || {};
 config.gateway.controlUi.basePath = process.env.CONTROL_PREFIX || '/clawnow';
+config.update =
+  config.update && typeof config.update === 'object' && !Array.isArray(config.update)
+    ? config.update
+    : {};
+// ClawNow manages OpenClaw upgrades at the platform level.
+// Disable per-VM update prompts and background auto-updates to avoid
+// user-triggered gateway restarts and version drift across tenants.
+config.update.checkOnStart = false;
+config.update.auto =
+  config.update.auto && typeof config.update.auto === 'object' && !Array.isArray(config.update.auto)
+    ? config.update.auto
+    : {};
+config.update.auto.enabled = false;
 config.browser =
   config.browser && typeof config.browser === 'object' && !Array.isArray(config.browser)
     ? config.browser
     : {};
 config.browser.enabled = true;
+// Gateway runs as root in ClawNow VMs. Chrome must run with --no-sandbox
+// in this environment, otherwise startup fails immediately.
+config.browser.noSandbox = true;
+// Keep browser config compatible with OpenClaw 2026.2.23 schema.
+// Do not set browser.extraArgs here (that key is rejected by this pinned version).
 const browserDefaultProfile =
   typeof config.browser.defaultProfile === 'string' ? config.browser.defaultProfile.trim() : '';
 if (!browserDefaultProfile || browserDefaultProfile.toLowerCase() === 'chrome') {
@@ -848,13 +1294,12 @@ if (allowedOrigin) {
 // ClawNow proxy terminates public traffic and forwards to loopback gateway.
 // Allow Host-header origin fallback so browser origin checks pass for per-VM public hosts.
 config.gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback = true;
-// In HTTP mode (no TLS), browser secure-context APIs are unavailable and OpenClaw
-// will otherwise clear requested scopes. We intentionally bypass device auth in
-// this mode so trusted-proxy sessions can still operate.
-const enableHttps = process.env.CLAWNOW_ENABLE_HTTPS === '1';
-if (!enableHttps) {
-  config.gateway.controlUi.dangerouslyDisableDeviceAuth = true;
-}
+// ClawNow proxy already authenticates users via signed JWT before forwarding to
+// the gateway, so we bypass the browser device-pairing ceremony in all modes.
+// In HTTP mode crypto.subtle is unavailable; in HTTPS mode device identity can
+// be generated but pairing approval has no meaningful extra security since the
+// proxy is the trust boundary.
+config.gateway.controlUi.dangerouslyDisableDeviceAuth = true;
 
 fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
 
@@ -968,9 +1413,11 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 EnvironmentFile=/etc/openclaw-gateway.env
-ExecStart=/usr/bin/env bash -lc 'openclaw gateway run --bind loopback --port ${GATEWAY_PORT} --force --allow-unconfigured'
+ExecStart=/usr/bin/env bash -lc '"${OPENCLAW_BIN_PATH}" gateway run --bind loopback --port ${GATEWAY_PORT} --allow-unconfigured'
 Restart=always
 RestartSec=3
+StandardOutput=append:/var/log/openclaw-gateway.log
+StandardError=append:/var/log/openclaw-gateway.log
 User=root
 WorkingDirectory=/root
 
@@ -1018,34 +1465,63 @@ fi
 write_state "desktop_start" "running" "starting desktop runtime"
 log_step "starting clawnow-desktop.service"
 systemctl enable clawnow-desktop.service
-systemctl restart clawnow-desktop.service
-systemctl is-active clawnow-desktop.service >/dev/null
+ensure_service_active clawnow-desktop.service 4 2
 
 write_state "gateway_start" "running" "starting openclaw gateway"
 log_step "starting openclaw-gateway.service"
 systemctl enable openclaw-gateway.service
-systemctl restart openclaw-gateway.service
-systemctl is-active openclaw-gateway.service >/dev/null
+ensure_service_active openclaw-gateway.service 4 2
 
 write_state "proxy_start" "running" "starting clawnow proxy"
 log_step "starting clawnow-proxy.service"
 systemctl enable clawnow-proxy.service
-systemctl restart clawnow-proxy.service
-systemctl is-active clawnow-proxy.service >/dev/null
+ensure_service_active clawnow-proxy.service 4 2
 
-if ! wait_for_tcp_port 127.0.0.1 "$GATEWAY_PORT" 120 1; then
+if ! ensure_port_ready_for_service 127.0.0.1 "$GATEWAY_PORT" openclaw-gateway.service "openclaw gateway" 120 1; then
   write_state "failed" "error" "openclaw gateway port ${GATEWAY_PORT} did not become ready in time"
   echo "OpenClaw gateway port ${GATEWAY_PORT} did not become ready in time" >&2
   exit 1
 fi
-if ! wait_for_tcp_port 127.0.0.1 "$PROXY_PORT" 120 1; then
+if ! ensure_port_ready_for_service 127.0.0.1 "$PROXY_PORT" clawnow-proxy.service "clawnow proxy" 120 1; then
   write_state "failed" "error" "proxy port ${PROXY_PORT} did not become ready in time"
   echo "ClawNow proxy port ${PROXY_PORT} did not become ready in time" >&2
   exit 1
 fi
-if ! wait_for_tcp_port 127.0.0.1 "$DESKTOP_NOVNC_PORT" 120 1; then
+if ! ensure_port_ready_for_service 127.0.0.1 "$DESKTOP_NOVNC_PORT" clawnow-desktop.service "desktop novnc" 120 1; then
   write_state "failed" "error" "desktop novnc port ${DESKTOP_NOVNC_PORT} did not become ready in time"
   echo "Desktop noVNC port ${DESKTOP_NOVNC_PORT} did not become ready in time" >&2
+  exit 1
+fi
+
+write_state "gateway_probe" "running" "verifying gateway rpc access"
+log_step "verifying gateway rpc access (local CLI -> gateway)"
+if ! verify_gateway_local_rpc 18 2; then
+  write_state "failed" "error" "gateway rpc probe failed (local auth mismatch)"
+  echo "Gateway RPC probe failed (local auth mismatch)" >&2
+  exit 1
+fi
+
+write_state "browser_prewarm" "running" "warming browser runtime"
+log_step "warming browser runtime for profile openclaw"
+if prewarm_browser_profile "openclaw" 4 4; then
+  write_state "browser_prewarm" "ok" "browser runtime warmed"
+else
+  # Do not fail VM provisioning on warm-up issues; gateway remains usable.
+  write_state "browser_prewarm" "warning" "browser warm-up failed, continuing"
+fi
+
+write_state "browser_locale" "running" "applying browser locale preferences"
+log_step "applying browser locale preferences for openclaw profile"
+enforce_browser_locale_preferences
+
+if ! ensure_port_ready_for_service 127.0.0.1 "$GATEWAY_PORT" openclaw-gateway.service "openclaw gateway" 45 1; then
+  write_state "failed" "error" "openclaw gateway became unavailable after browser warm-up"
+  echo "OpenClaw gateway became unavailable after browser warm-up" >&2
+  exit 1
+fi
+if ! ensure_port_ready_for_service 127.0.0.1 "$PROXY_PORT" clawnow-proxy.service "clawnow proxy" 45 1; then
+  write_state "failed" "error" "proxy became unavailable after browser warm-up"
+  echo "ClawNow proxy became unavailable after browser warm-up" >&2
   exit 1
 fi
 
