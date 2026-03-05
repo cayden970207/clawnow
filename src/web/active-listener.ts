@@ -8,6 +8,13 @@ export type ActiveWebSendOptions = {
   fileName?: string;
 };
 
+export type ActiveWebDirectoryGroup = {
+  id: string;
+  name?: string;
+  communityJid?: string;
+  communityName?: string;
+};
+
 export type ActiveWebListener = {
   sendMessage: (
     to: string,
@@ -25,6 +32,8 @@ export type ActiveWebListener = {
     participant?: string,
   ) => Promise<void>;
   sendComposingTo: (to: string) => Promise<void>;
+  listGroups?: () => Promise<ActiveWebDirectoryGroup[]>;
+  resolveGroup?: (jid: string) => Promise<ActiveWebDirectoryGroup | null>;
   close?: () => Promise<void>;
 };
 

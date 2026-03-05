@@ -21,6 +21,117 @@ import {
 import { downloadInboundMedia } from "./media.js";
 import { createWebSendApi } from "./send-api.js";
 import type { WebInboundMessage, WebListenerCloseReason } from "./types.js";
+import type { ActiveWebDirectoryGroup } from "../active-listener.js";
+
+function toTrimmedString(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function parseLiveGroupsPayload(payload: unknown): ActiveWebDirectoryGroup[] {
+  if (!payload || typeof payload !== "object") {
+    return [];
+  }
+
+  const groups: ActiveWebDirectoryGroup[] = [];
+  const subjectById = new Map<string, string>();
+  for (const [key, raw] of Object.entries(payload as Record<string, unknown>)) {
+    const group =
+      raw && typeof raw === "object" ? (raw as Record<string, unknown>) : ({} as Record<string, unknown>);
+    const id = toTrimmedString(group.id) ?? toTrimmedString(key);
+    if (!id || !id.endsWith("@g.us")) {
+      continue;
+    }
+    const name = toTrimmedString(group.subject) ?? undefined;
+    const communityJid =
+      toTrimmedString(group.linkedParent) ??
+      toTrimmedString(group.parent) ??
+      toTrimmedString(group.parentGroupJid) ??
+      undefined;
+    if (name) {
+      subjectById.set(id, name);
+    }
+    groups.push({
+      id,
+      name,
+      communityJid,
+    });
+  }
+
+  const normalized = groups.map((group) => ({
+    ...group,
+    communityName: group.communityJid ? subjectById.get(group.communityJid) : undefined,
+  }));
+  return normalized.toSorted((a, b) => {
+    const left = `${a.name ?? ""}\u0000${a.id}`.toLowerCase();
+    const right = `${b.name ?? ""}\u0000${b.id}`.toLowerCase();
+    return left.localeCompare(right);
+  });
+}
+
+async function listLiveGroups(sock: unknown): Promise<ActiveWebDirectoryGroup[]> {
+  const fetchAllParticipating = (
+    sock as {
+      groupFetchAllParticipating?: () => Promise<unknown>;
+    }
+  ).groupFetchAllParticipating;
+  if (typeof fetchAllParticipating !== "function") {
+    return [];
+  }
+  try {
+    const payload = await fetchAllParticipating();
+    return parseLiveGroupsPayload(payload);
+  } catch (err) {
+    logVerbose(`Failed to fetch live WhatsApp groups: ${String(err)}`);
+    return [];
+  }
+}
+
+function parseLiveGroupMetadata(jid: string, payload: unknown): ActiveWebDirectoryGroup | null {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+  const group = payload as Record<string, unknown>;
+  const id = toTrimmedString(group.id) ?? toTrimmedString(jid);
+  if (!id || !id.endsWith("@g.us")) {
+    return null;
+  }
+  const name = toTrimmedString(group.subject) ?? toTrimmedString(group.name) ?? undefined;
+  const communityJid =
+    toTrimmedString(group.linkedParent) ??
+    toTrimmedString(group.parent) ??
+    toTrimmedString(group.parentGroupJid) ??
+    undefined;
+  return {
+    id,
+    name,
+    communityJid,
+  };
+}
+
+async function resolveLiveGroup(
+  sock: unknown,
+  jid: string,
+): Promise<ActiveWebDirectoryGroup | null> {
+  const readMetadata = (
+    sock as {
+      groupMetadata?: (groupJid: string) => Promise<unknown>;
+    }
+  ).groupMetadata;
+  if (typeof readMetadata !== "function") {
+    return null;
+  }
+  try {
+    const payload = await readMetadata(jid);
+    return parseLiveGroupMetadata(jid, payload);
+  } catch (err) {
+    logVerbose(`Failed to fetch WhatsApp group metadata for ${jid}: ${String(err)}`);
+    return null;
+  }
+}
 
 export async function monitorWebInbox(options: {
   verbose: boolean;
@@ -403,5 +514,7 @@ export async function monitorWebInbox(options: {
     },
     // IPC surface (sendMessage/sendPoll/sendReaction/sendComposingTo)
     ...sendApi,
+    listGroups: async () => await listLiveGroups(sock),
+    resolveGroup: async (jid: string) => await resolveLiveGroup(sock, jid),
   } as const;
 }

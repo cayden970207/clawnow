@@ -1,3 +1,6 @@
+import type { Dirent } from "node:fs";
+import fs from "node:fs/promises";
+import path from "node:path";
 import {
   applyAccountNameToChannelSection,
   buildChannelConfigSchema,
@@ -28,11 +31,232 @@ import {
   resolveWhatsAppMentionStripPatterns,
   whatsappOnboardingAdapter,
   WhatsAppConfigSchema,
+  type ChannelDirectoryEntry,
   type ChannelMessageActionName,
   type ChannelPlugin,
+  type OpenClawConfig,
   type ResolvedWhatsAppAccount,
 } from "openclaw/plugin-sdk";
 import { getWhatsAppRuntime } from "./runtime.js";
+
+type WhatsAppDirectoryGroupSnapshot = {
+  id: string;
+  name?: string;
+  communityJid?: string;
+  communityName?: string;
+  source?: "live" | "config" | "sender-key" | "metadata" | "merged";
+};
+
+const GROUP_JID_RE = /[0-9]{6,}(?:-[0-9]+)?(?:\:[0-9]+)?@g\.us/gi;
+
+function toTrimmedString(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function normalizeDirectoryGroupFromEntry(
+  entry: ChannelDirectoryEntry,
+): WhatsAppDirectoryGroupSnapshot | null {
+  const id = toTrimmedString(entry.id);
+  if (!id || !id.endsWith("@g.us")) {
+    return null;
+  }
+  const name = toTrimmedString(entry.name);
+  return {
+    id,
+    name,
+    source: "config",
+  };
+}
+
+function normalizeDirectoryGroupFromLive(
+  value: unknown,
+  source: WhatsAppDirectoryGroupSnapshot["source"] = "live",
+): WhatsAppDirectoryGroupSnapshot | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const entry = value as Record<string, unknown>;
+  const id = toTrimmedString(entry.id);
+  if (!id || !id.endsWith("@g.us")) {
+    return null;
+  }
+  const name = toTrimmedString(entry.name);
+  const communityJid = toTrimmedString(entry.communityJid);
+  const communityName = toTrimmedString(entry.communityName);
+  return {
+    id,
+    name,
+    communityJid,
+    communityName,
+    source,
+  };
+}
+
+function mergeDirectoryGroups(
+  ...lists: WhatsAppDirectoryGroupSnapshot[][]
+): WhatsAppDirectoryGroupSnapshot[] {
+  const merged = new Map<string, WhatsAppDirectoryGroupSnapshot>();
+  for (const groups of lists) {
+    for (const group of groups) {
+      const existing = merged.get(group.id);
+      if (!existing) {
+        merged.set(group.id, group);
+        continue;
+      }
+      merged.set(group.id, {
+        id: group.id,
+        name: group.name ?? existing.name,
+        communityJid: group.communityJid ?? existing.communityJid,
+        communityName: group.communityName ?? existing.communityName,
+        source:
+          existing.source && group.source && existing.source !== group.source
+            ? "merged"
+            : (group.source ?? existing.source),
+      });
+    }
+  }
+  const byId = new Map<string, WhatsAppDirectoryGroupSnapshot>(merged);
+  const groups = Array.from(merged.values()).map((group) => ({
+    ...group,
+    communityName:
+      group.communityName ??
+      (group.communityJid ? toTrimmedString(byId.get(group.communityJid)?.name) : undefined),
+  }));
+  return groups.toSorted((a, b) => {
+    const left = `${a.name ?? ""}\u0000${a.id}`.toLowerCase();
+    const right = `${b.name ?? ""}\u0000${b.id}`.toLowerCase();
+    return left.localeCompare(right);
+  });
+}
+
+function extractGroupJids(value: string): string[] {
+  const matches = value.match(GROUP_JID_RE) ?? [];
+  return matches.map((entry) => entry.toLowerCase());
+}
+
+async function readSenderKeyGroups(
+  authDir: string | undefined,
+): Promise<WhatsAppDirectoryGroupSnapshot[]> {
+  if (!authDir) {
+    return [];
+  }
+
+  let entries: Dirent[] = [];
+  try {
+    entries = await fs.readdir(authDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const jids = new Set<string>();
+  for (const entry of entries) {
+    if (!entry.isFile()) {
+      continue;
+    }
+    if (!entry.name.startsWith("sender-key-") || !entry.name.endsWith(".json")) {
+      continue;
+    }
+
+    const decodedFileName = (() => {
+      try {
+        return decodeURIComponent(entry.name);
+      } catch {
+        return entry.name;
+      }
+    })();
+    const fromFileName = extractGroupJids(decodedFileName);
+    for (const jid of fromFileName) {
+      jids.add(jid);
+    }
+    if (fromFileName.length > 0) {
+      continue;
+    }
+
+    // Some providers hash filenames; a content scan keeps discovery resilient.
+    try {
+      const raw = await fs.readFile(path.join(authDir, entry.name), "utf8");
+      for (const jid of extractGroupJids(raw)) {
+        jids.add(jid);
+      }
+    } catch {
+      // Best-effort discovery only.
+    }
+  }
+
+  return Array.from(jids.values()).map((id) => ({
+    id,
+    source: "sender-key" as const,
+  }));
+}
+
+async function resolveWhatsAppDirectoryGroups(params: {
+  cfg: OpenClawConfig;
+  accountId: string;
+}): Promise<WhatsAppDirectoryGroupSnapshot[]> {
+  const configGroupsRaw = await listWhatsAppDirectoryGroupsFromConfig({
+    cfg: params.cfg,
+    accountId: params.accountId,
+    limit: 500,
+  });
+  const configGroups = configGroupsRaw
+    .map((entry) => normalizeDirectoryGroupFromEntry(entry))
+    .filter((entry): entry is WhatsAppDirectoryGroupSnapshot => Boolean(entry));
+  const account = resolveWhatsAppAccount({
+    cfg: params.cfg,
+    accountId: params.accountId,
+  });
+  const senderKeyGroups = await readSenderKeyGroups(account.authDir);
+  const baseGroups = mergeDirectoryGroups(configGroups, senderKeyGroups);
+
+  const listener = getWhatsAppRuntime().channel.whatsapp.getActiveWebListener(params.accountId);
+  if (!listener?.listGroups) {
+    return baseGroups;
+  }
+
+  let groups = baseGroups;
+  try {
+    const liveGroupsRaw = await listener.listGroups();
+    const liveGroups = liveGroupsRaw
+      .map((entry) => normalizeDirectoryGroupFromLive(entry))
+      .filter((entry): entry is WhatsAppDirectoryGroupSnapshot => Boolean(entry));
+    groups = mergeDirectoryGroups(baseGroups, liveGroups);
+  } catch {
+    return baseGroups;
+  }
+
+  if (!listener.resolveGroup) {
+    return groups;
+  }
+
+  const unresolved = groups
+    .filter((group) => !toTrimmedString(group.name))
+    .map((group) => group.id)
+    .slice(0, 200);
+  if (unresolved.length === 0) {
+    return groups;
+  }
+
+  const metadataGroups = (
+    await Promise.all(
+      unresolved.map(async (jid) => {
+        try {
+          const metadata = await listener.resolveGroup?.(jid);
+          return normalizeDirectoryGroupFromLive(metadata, "metadata");
+        } catch {
+          return null;
+        }
+      }),
+    )
+  ).filter((entry): entry is WhatsAppDirectoryGroupSnapshot => Boolean(entry));
+  if (metadataGroups.length === 0) {
+    return groups;
+  }
+  return mergeDirectoryGroups(groups, metadataGroups);
+}
 
 const meta = getChatChannelMeta("whatsapp");
 
@@ -390,8 +614,12 @@ export const whatsappPlugin: ChannelPlugin<ResolvedWhatsAppAccount> = {
         lastError: snapshot.lastError ?? null,
       };
     },
-    buildAccountSnapshot: async ({ account, runtime }) => {
+    buildAccountSnapshot: async ({ account, cfg, runtime }) => {
       const linked = await getWhatsAppRuntime().channel.whatsapp.webAuthExists(account.authDir);
+      const directoryGroups = await resolveWhatsAppDirectoryGroups({
+        cfg,
+        accountId: account.accountId,
+      });
       return {
         accountId: account.accountId,
         name: account.name,
@@ -408,6 +636,7 @@ export const whatsappPlugin: ChannelPlugin<ResolvedWhatsAppAccount> = {
         lastError: runtime?.lastError ?? null,
         dmPolicy: account.dmPolicy,
         allowFrom: account.allowFrom,
+        directoryGroups,
       };
     },
     resolveAccountState: ({ configured }) => (configured ? "linked" : "not linked"),
