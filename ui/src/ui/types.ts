@@ -55,7 +55,16 @@ export type ChannelAccountSnapshot = {
   port?: number | null;
   probe?: unknown;
   audit?: unknown;
+  directoryGroups?: ChannelDirectoryGroupSnapshot[] | null;
   application?: unknown;
+};
+
+export type ChannelDirectoryGroupSnapshot = {
+  id: string;
+  name?: string | null;
+  communityJid?: string | null;
+  communityName?: string | null;
+  source?: string | null;
 };
 
 export type WhatsAppSelf = {
@@ -454,6 +463,75 @@ export type SessionsPatchResult = {
     reasoningLevel?: string;
     elevatedLevel?: string;
   };
+};
+
+// === Simplified Task Types (redesigned UI) ===
+
+export type SimplifiedTaskStatus = "queued" | "running" | "done" | "failed";
+
+export type TaskSource =
+  | "chat"
+  | "cron"
+  | "whatsapp"
+  | "telegram"
+  | "discord"
+  | "signal"
+  | "imessage"
+  | "unknown";
+
+export type TaskStep = { tool: string; result: string; phase: string };
+
+export type TaskRunSummary = {
+  runId: string;
+  source: TaskSource;
+  status: SimplifiedTaskStatus;
+  title: string;
+  preview: string;
+  startedAt: number;
+  endedAt?: number;
+  durationMs?: number;
+  updatedAt: number;
+  errorReason?: string;
+  cronId?: string;
+};
+
+export type TaskRunDetail = TaskRunSummary & {
+  summary: string;
+  steps: TaskStep[];
+};
+
+export type TasksListResult = {
+  ts: number;
+  total: number;
+  hasMore: boolean;
+  nextCursor: number | null;
+  items: TaskRunSummary[];
+};
+
+export type ScheduledTask = {
+  cronId: string;
+  label: string;
+  schedule: string;
+  nextRunAt: number;
+  lastStatus?: SimplifiedTaskStatus;
+  lastDurationMs?: number;
+  streak: { success: number; total: number };
+};
+
+export type TaskStreamEvent = {
+  type: "task.update" | "task.status";
+  runId: string;
+  status: SimplifiedTaskStatus;
+  entry?: { tool: string; phase: string; text?: string };
+  streamText?: string;
+};
+
+export type TaskStreamEntry = {
+  tool: string;
+  phase: string;
+  text?: string;
+  streamText?: string;
+  timestamp: number;
 };
 
 export type {
