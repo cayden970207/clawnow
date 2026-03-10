@@ -8,6 +8,7 @@ import {
   extractSteps,
   toSimplifiedStatus,
   type TaskNode,
+  type TaskStreamEvent,
   type TaskTraceLogger,
 } from "./task-traces.js";
 
@@ -314,5 +315,187 @@ describe("TaskTraceStore", () => {
     expect(detail?.run.nodes.map((node) => node.type)).toEqual(["trigger", "finalize"]);
 
     await store.stop();
+  });
+
+  describe("task event emission", () => {
+    it("emits task.update on tool ingest", async () => {
+      const store = new TaskTraceStore({
+        stateDir: tempDir,
+        retentionDays: 180,
+        log: createLogger(),
+      });
+      await store.start();
+
+      const events: TaskStreamEvent[] = [];
+      store.onTaskEvent = (e) => events.push(e);
+
+      const runId = "run-stream-tool";
+      const baseTs = Date.now();
+
+      store.ingest({
+        runId,
+        seq: 1,
+        stream: "lifecycle",
+        ts: baseTs,
+        sessionKey: "agent:main:main",
+        data: { phase: "start", startedAt: baseTs },
+      });
+
+      store.ingest({
+        runId,
+        seq: 2,
+        stream: "tool",
+        ts: baseTs + 10,
+        data: {
+          phase: "start",
+          toolCallId: "tc-1",
+          name: "web_search",
+          args: { query: "test" },
+        },
+      });
+
+      store.ingest({
+        runId,
+        seq: 3,
+        stream: "tool",
+        ts: baseTs + 20,
+        data: {
+          phase: "result",
+          toolCallId: "tc-1",
+          name: "web_search",
+          isError: false,
+          result: "Found 5 results",
+        },
+      });
+
+      expect(events.length).toBeGreaterThanOrEqual(2);
+      const toolEvents = events.filter(
+        (e) => e.type === "task.update" && e.entry?.tool === "web_search",
+      );
+      expect(toolEvents.length).toBe(2);
+      expect(toolEvents[0].entry?.phase).toBe("start");
+      expect(toolEvents[1].entry?.phase).toBe("result");
+      expect(toolEvents[0].status).toBe("running");
+
+      await store.stop();
+    });
+
+    it("emits task.update on assistant ingest", async () => {
+      const store = new TaskTraceStore({
+        stateDir: tempDir,
+        retentionDays: 180,
+        log: createLogger(),
+      });
+      await store.start();
+
+      const events: TaskStreamEvent[] = [];
+      store.onTaskEvent = (e) => events.push(e);
+
+      const runId = "run-stream-assistant";
+      const baseTs = Date.now();
+
+      store.ingest({
+        runId,
+        seq: 1,
+        stream: "lifecycle",
+        ts: baseTs,
+        sessionKey: "agent:main:main",
+        data: { phase: "start", startedAt: baseTs },
+      });
+
+      store.ingest({
+        runId,
+        seq: 2,
+        stream: "assistant",
+        ts: baseTs + 10,
+        data: { text: "Here are the results" },
+      });
+
+      const assistantEvents = events.filter(
+        (e) => e.type === "task.update" && e.streamText != null,
+      );
+      expect(assistantEvents.length).toBe(1);
+      expect(assistantEvents[0].streamText).toContain("results");
+      expect(assistantEvents[0].status).toBe("running");
+
+      await store.stop();
+    });
+
+    it("emits task.status on finalize", async () => {
+      const store = new TaskTraceStore({
+        stateDir: tempDir,
+        retentionDays: 180,
+        log: createLogger(),
+      });
+      await store.start();
+
+      const events: TaskStreamEvent[] = [];
+      store.onTaskEvent = (e) => events.push(e);
+
+      const runId = "run-stream-finalize";
+      const baseTs = Date.now();
+
+      store.ingest({
+        runId,
+        seq: 1,
+        stream: "lifecycle",
+        ts: baseTs,
+        sessionKey: "agent:main:main",
+        data: { phase: "start", startedAt: baseTs },
+      });
+
+      store.ingest({
+        runId,
+        seq: 2,
+        stream: "lifecycle",
+        ts: baseTs + 100,
+        data: { phase: "end", endedAt: baseTs + 100 },
+      });
+
+      const statusEvents = events.filter((e) => e.type === "task.status");
+      expect(statusEvents.length).toBe(1);
+      expect(statusEvents[0].runId).toBe(runId);
+      expect(statusEvents[0].status).toBe("done");
+
+      await store.stop();
+    });
+
+    it("emits task.status with failed on error finalize", async () => {
+      const store = new TaskTraceStore({
+        stateDir: tempDir,
+        retentionDays: 180,
+        log: createLogger(),
+      });
+      await store.start();
+
+      const events: TaskStreamEvent[] = [];
+      store.onTaskEvent = (e) => events.push(e);
+
+      const runId = "run-stream-error";
+      const baseTs = Date.now();
+
+      store.ingest({
+        runId,
+        seq: 1,
+        stream: "lifecycle",
+        ts: baseTs,
+        sessionKey: "agent:main:main",
+        data: { phase: "start", startedAt: baseTs },
+      });
+
+      store.ingest({
+        runId,
+        seq: 2,
+        stream: "lifecycle",
+        ts: baseTs + 100,
+        data: { phase: "error", endedAt: baseTs + 100, error: "something broke" },
+      });
+
+      const statusEvents = events.filter((e) => e.type === "task.status");
+      expect(statusEvents.length).toBe(1);
+      expect(statusEvents[0].status).toBe("failed");
+
+      await store.stop();
+    });
   });
 });

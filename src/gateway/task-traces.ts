@@ -156,6 +156,14 @@ export type TasksGetResult = {
   run: TaskRunDetail;
 };
 
+export type TaskStreamEvent = {
+  type: "task.update" | "task.status";
+  runId: string;
+  status: SimplifiedTaskStatus;
+  entry?: { tool: string; phase: string; text?: string };
+  streamText?: string;
+};
+
 export type TaskTraceMetrics = {
   task_trace_events_ingested: number;
   task_trace_runs_completed: number;
@@ -517,6 +525,8 @@ export class TaskTraceStore {
   private metrics: TaskTraceMetrics = makeEmptyMetrics();
   private backfillPromise: Promise<void> | null = null;
   private backfillCompleted = false;
+
+  onTaskEvent?: (event: TaskStreamEvent) => void;
 
   constructor(private readonly options: TaskTraceStoreOptions) {
     this.stateDir = options.stateDir ?? resolveStateDir();
@@ -1199,6 +1209,13 @@ export class TaskTraceStore {
       level: "info",
       text: text || "Assistant output",
     });
+
+    this.onTaskEvent?.({
+      type: "task.update",
+      runId: run.summary.runId,
+      status: toSimplifiedStatus(run.summary.status),
+      streamText: text || undefined,
+    });
   }
 
   private ingestTool(run: ActiveRun, event: AgentEventPayload) {
@@ -1256,6 +1273,13 @@ export class TaskTraceStore {
       phase,
       level: isError ? "error" : "info",
       text: `${toolName} ${phase}${resultSummary ? `: ${resultSummary}` : ""}`,
+    });
+
+    this.onTaskEvent?.({
+      type: "task.update",
+      runId: run.summary.runId,
+      status: toSimplifiedStatus(run.summary.status),
+      entry: { tool: toolName, phase, text: summaryText || undefined },
     });
   }
 
@@ -1338,6 +1362,12 @@ export class TaskTraceStore {
     this.cacheRecentDetail(detail);
     this.persistRun(summary, detail);
     this.metrics.task_trace_runs_completed += 1;
+
+    this.onTaskEvent?.({
+      type: "task.status",
+      runId: run.summary.runId,
+      status: toSimplifiedStatus(params.status),
+    });
   }
 
   private cacheRecentDetail(detail: TaskRunDetail) {

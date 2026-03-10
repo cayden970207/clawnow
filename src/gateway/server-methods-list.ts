@@ -56,6 +56,9 @@ const BASE_METHODS = [
   "sessions.reset",
   "sessions.delete",
   "sessions.compact",
+  "tasks.list",
+  "tasks.get",
+  "tasks.scheduled",
   "last-heartbeat",
   "set-heartbeats",
   "wake",
@@ -120,5 +123,6 @@ export const GATEWAY_EVENTS = [
   "voicewake.changed",
   "exec.approval.requested",
   "exec.approval.resolved",
+  "task.stream",
   GATEWAY_EVENT_UPDATE_AVAILABLE,
 ];

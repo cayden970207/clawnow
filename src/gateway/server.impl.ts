@@ -90,6 +90,7 @@ import {
 } from "./server/health-state.js";
 import { loadGatewayTlsRuntime } from "./server/tls.js";
 import { ensureGatewayStartupAuth } from "./startup-auth.js";
+import { TaskTraceStore } from "./task-traces.js";
 
 export { __resetModelCatalogCacheForTest } from "./server-model-catalog.js";
 
@@ -264,7 +265,13 @@ export async function startGatewayServer(
   initSubagentRegistry();
   const defaultAgentId = resolveDefaultAgentId(cfgAtStart);
   const defaultWorkspaceDir = resolveAgentWorkspaceDir(cfgAtStart, defaultAgentId);
-  const baseMethods = listGatewayMethods();
+  const tasksFeatureEnabled = cfgAtStart.gateway?.controlUi?.features?.tasks !== false;
+  const baseMethods = listGatewayMethods().filter((method) => {
+    if (!tasksFeatureEnabled && (method === "tasks.list" || method === "tasks.get")) {
+      return false;
+    }
+    return true;
+  });
   const emptyPluginRegistry = createEmptyPluginRegistry();
   const { pluginRegistry, gatewayMethods: baseGatewayMethods } = minimalTestGateway
     ? { pluginRegistry: emptyPluginRegistry, gatewayMethods: baseMethods }
@@ -351,6 +358,10 @@ export async function startGatewayServer(
 
   const wizardRunner = opts.wizardRunner ?? runOnboardingWizard;
   const { wizardSessions, findRunningWizard, purgeWizardSession } = createWizardSessionTracker();
+  const taskTraces = new TaskTraceStore({
+    log: log.child("task-traces"),
+  });
+  await taskTraces.start();
 
   const deps = createDefaultDeps();
   let canvasHostServer: CanvasHostServer | null = null;
@@ -401,6 +412,11 @@ export async function startGatewayServer(
     logHooks,
     logPlugins,
   });
+  // Wire real-time task stream events to gateway broadcast.
+  taskTraces.onTaskEvent = (event) => {
+    broadcast("task.stream", event, { dropIfSlow: true });
+  };
+
   let bonjourStop: (() => Promise<void>) | null = null;
   const nodeRegistry = new NodeRegistry();
   const nodePresenceTimers = new Map<string, ReturnType<typeof setInterval>>();
@@ -505,16 +521,23 @@ export async function startGatewayServer(
   const agentUnsub = minimalTestGateway
     ? null
     : onAgentEvent(
-        createAgentEventHandler({
-          broadcast,
-          broadcastToConnIds,
-          nodeSendToSession,
-          agentRunSeq,
-          chatRunState,
-          resolveSessionKeyForRun,
-          clearAgentRunContext,
-          toolEventRecipients,
-        }),
+        ((handler) => {
+          return (evt) => {
+            taskTraces.ingest(evt);
+            handler(evt);
+          };
+        })(
+          createAgentEventHandler({
+            broadcast,
+            broadcastToConnIds,
+            nodeSendToSession,
+            agentRunSeq,
+            chatRunState,
+            resolveSessionKeyForRun,
+            clearAgentRunContext,
+            toolEventRecipients,
+          }),
+        ),
       );
 
   const heartbeatUnsub = minimalTestGateway
@@ -634,6 +657,8 @@ export async function startGatewayServer(
       markChannelLoggedOut,
       wizardRunner,
       broadcastVoiceWakeChanged,
+      taskTraces,
+      tasksFeatureEnabled,
     },
   });
   logGatewayStartup({
@@ -776,6 +801,7 @@ export async function startGatewayServer(
         skillsRefreshTimer = null;
       }
       skillsChangeUnsub();
+      await taskTraces.stop();
       authRateLimiter?.dispose();
       channelHealthMonitor?.stop();
       await close(opts);
