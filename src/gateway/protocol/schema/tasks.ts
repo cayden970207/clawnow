@@ -184,3 +184,35 @@ export const SimplifiedTaskRunDetailSchema = Type.Intersect([
     { additionalProperties: false },
   ),
 ]);
+
+/* ── Scheduled tasks (cron visibility for Task UI) ──────────── */
+
+const ScheduledTaskLastStatusSchema = Type.Unsafe<"queued" | "running" | "done" | "failed">({
+  type: "string",
+  enum: ["queued", "running", "done", "failed"],
+});
+
+export const ScheduledTaskSchema = Type.Object(
+  {
+    cronId: NonEmptyString,
+    label: Type.String(),
+    schedule: Type.String(),
+    nextRunAt: Type.Optional(Type.Integer({ minimum: 0 })),
+    lastStatus: Type.Optional(ScheduledTaskLastStatusSchema),
+    lastDurationMs: Type.Optional(Type.Integer({ minimum: 0 })),
+    streak: Type.Object({
+      success: Type.Integer({ minimum: 0 }),
+      total: Type.Integer({ minimum: 0 }),
+    }),
+  },
+  { additionalProperties: false },
+);
+
+export const TasksScheduledParamsSchema = Type.Object({}, { additionalProperties: false });
+
+export const TasksScheduledResultSchema = Type.Object(
+  {
+    items: Type.Array(ScheduledTaskSchema),
+  },
+  { additionalProperties: false },
+);
