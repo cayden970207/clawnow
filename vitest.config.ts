@@ -39,6 +39,7 @@ export default defineConfig({
       "test/**/*.test.ts",
       "ui/src/ui/views/usage-render-details.test.ts",
       "ui/src/ui/controllers/agents.test.ts",
+      "ui/src/ui/views/tasks.test.ts",
     ],
     setupFiles: ["test/setup.ts"],
     exclude: [
