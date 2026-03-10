@@ -63,7 +63,13 @@ import {
   updateSkillEnabled,
 } from "./controllers/skills.ts";
 import { icons } from "./icons.ts";
-import { normalizeBasePath, TAB_GROUPS, subtitleForTab, titleForTab } from "./navigation.ts";
+import {
+  normalizeBasePath,
+  pathForTab,
+  TAB_GROUPS,
+  subtitleForTab,
+  titleForTab,
+} from "./navigation.ts";
 import { renderAgents } from "./views/agents.ts";
 import { renderChannels } from "./views/channels.ts";
 import { renderChat } from "./views/chat.ts";
@@ -78,6 +84,8 @@ import { renderNodes } from "./views/nodes.ts";
 import { renderOverview } from "./views/overview.ts";
 import { renderSessions } from "./views/sessions.ts";
 import { renderSkills } from "./views/skills.ts";
+import { renderTasks } from "./views/tasks.ts";
+import { renderWhatsAppPage } from "./views/whatsapp.ts";
 
 const AVATAR_DATA_RE = /^data:/i;
 const AVATAR_HTTP_RE = /^https?:\/\//i;
@@ -117,6 +125,14 @@ function uniquePreserveOrder(values: string[]): string[] {
     output.push(normalized);
   }
   return output;
+}
+
+function hasTasksMethods(state: AppViewState): boolean {
+  const methods = state.hello?.features?.methods;
+  if (!Array.isArray(methods) || methods.length === 0) {
+    return true;
+  }
+  return methods.includes("tasks.list") && methods.includes("tasks.get");
 }
 
 function resolveAssistantAvatarUrl(state: AppViewState): string | undefined {
@@ -251,6 +267,16 @@ export function renderApp(state: AppViewState) {
             <span>${t("common.health")}</span>
             <span class="mono">${state.connected ? t("common.ok") : t("common.offline")}</span>
           </div>
+          ${
+            state.browserTaskLive
+              ? html`
+                <div class="pill pill--live" title=${t("common.liveHint")}>
+                  <span class="statusDot live"></span>
+                  <span>${t("common.live")}</span>
+                </div>
+              `
+              : nothing
+          }
           ${renderThemeToggle(state)}
         </div>
       </header>
@@ -397,6 +423,25 @@ export function renderApp(state: AppViewState) {
         }
 
         ${
+          state.tab === "whatsapp"
+            ? renderWhatsAppPage({
+                loading: state.channelsLoading,
+                snapshot: state.channelsSnapshot,
+                lastError: state.channelsError,
+                lastSuccessAt: state.channelsLastSuccess,
+                whatsappMessage: state.whatsappLoginMessage,
+                whatsappQrDataUrl: state.whatsappLoginQrDataUrl,
+                whatsappBusy: state.whatsappBusy,
+                channelsPath: pathForTab("channels", state.basePath),
+                onRefresh: (probe) => loadChannels(state, probe),
+                onWhatsAppStart: (force) => state.handleWhatsAppStart(force),
+                onWhatsAppWait: () => state.handleWhatsAppWait(),
+                onWhatsAppLogout: () => state.handleWhatsAppLogout(),
+              })
+            : nothing
+        }
+
+        ${
           state.tab === "instances"
             ? renderInstances({
                 loading: state.presenceLoading,
@@ -405,6 +450,55 @@ export function renderApp(state: AppViewState) {
                 statusMessage: state.presenceStatus,
                 onRefresh: () => loadPresence(state),
               })
+            : nothing
+        }
+
+        ${
+          state.tab === "tasks"
+            ? hasTasksMethods(state)
+              ? renderTasks({
+                  loading: state.tasksLoading,
+                  error: state.tasksError,
+                  running: state.tasksRunning,
+                  queued: state.tasksQueued,
+                  done: state.tasksDone,
+                  scheduled: state.tasksScheduled,
+                  expandedRunId: state.tasksExpandedRunId,
+                  expandedDetail: state.tasksExpandedDetail,
+                  detailLoading: state.tasksDetailLoading,
+                  streamEntries: state.tasksStreamEntries,
+                  filterChannels: state.tasksFilterChannels,
+                  filterStatus: state.tasksFilterStatus,
+                  filterTimeRange: state.tasksFilterTimeRange,
+                  filterQuery: state.tasksFilterQuery,
+                  doneHasMore: state.tasksDoneHasMore,
+                  onToggleExpand: (runId) => {
+                    state.toggleTaskExpanded(runId);
+                  },
+                  onFilter: (filters) => {
+                    state.applyTaskFilters(filters as Parameters<typeof state.applyTaskFilters>[0]);
+                    void state.loadTasks();
+                  },
+                  onSearch: (query) => {
+                    state.applyTaskFilters({ query });
+                    void state.loadTasks();
+                  },
+                  onLoadMoreDone: () => {
+                    void state.loadMoreDone();
+                  },
+                  onRefresh: () => {
+                    void state.loadTasks();
+                    void state.loadScheduled();
+                  },
+                })
+              : html`
+                  <section class="card" style="margin-top: 0">
+                    <div class="card-title">Tasks</div>
+                    <div class="callout">
+                      Tasks board is disabled on this gateway (gateway.controlUi.features.tasks=false).
+                    </div>
+                  </section>
+                `
             : nothing
         }
 

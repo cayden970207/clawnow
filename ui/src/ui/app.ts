@@ -58,6 +58,16 @@ import type { DevicePairingList } from "./controllers/devices.ts";
 import type { ExecApprovalRequest } from "./controllers/exec-approval.ts";
 import type { ExecApprovalsFile, ExecApprovalsSnapshot } from "./controllers/exec-approvals.ts";
 import type { SkillMessage } from "./controllers/skills.ts";
+import {
+  applyTaskFilters as applyTaskFiltersInternal,
+  loadTaskDetail as loadTaskDetailInternal,
+  loadTasks as loadTasksInternal,
+  loadScheduled as loadScheduledInternal,
+  toggleTaskExpanded as toggleTaskExpandedInternal,
+  handleTaskStreamEvent as handleTaskStreamEventInternal,
+  loadMoreDone as loadMoreDoneInternal,
+} from "./controllers/tasks.ts";
+import type { TasksFilterTimeRange } from "./controllers/tasks.ts";
 import type { GatewayBrowserClient, GatewayHelloOk } from "./gateway.ts";
 import type { Tab } from "./navigation.ts";
 import { loadSettings, type UiSettings } from "./storage.ts";
@@ -74,13 +84,20 @@ import type {
   HealthSnapshot,
   LogEntry,
   LogLevel,
+  NostrProfile,
   PresenceEntry,
+  ScheduledTask,
   ChannelsStatusSnapshot,
   SessionsListResult,
+  SimplifiedTaskStatus,
   SkillStatusReport,
+  TaskRunSummary,
+  TaskRunDetail,
+  TaskStreamEntry,
+  TaskStreamEvent,
+  TaskSource,
   ToolsCatalogResult,
   StatusSummary,
-  NostrProfile,
 } from "./types.ts";
 import { type ChatAttachment, type ChatQueueItem, type CronFormState } from "./ui-types.ts";
 import { generateUUID } from "./uuid.ts";
@@ -130,6 +147,7 @@ export class OpenClawApp extends LitElement {
   @state() eventLog: EventLogEntry[] = [];
   private eventLogBuffer: EventLogEntry[] = [];
   private toolStreamSyncTimer: number | null = null;
+  private tasksSyncTimer: number | null = null;
   private sidebarCloseTimer: number | null = null;
 
   @state() assistantName = bootAssistantIdentity.name;
@@ -149,6 +167,7 @@ export class OpenClawApp extends LitElement {
   @state() fallbackStatus: FallbackStatus | null = null;
   @state() chatAvatarUrl: string | null = null;
   @state() chatThinkingLevel: string | null = null;
+  @state() browserTaskLive = false;
   @state() chatQueue: ChatQueueItem[] = [];
   @state() chatAttachments: ChatAttachment[] = [];
   @state() chatManualRefreshInFlight = false;
@@ -245,6 +264,25 @@ export class OpenClawApp extends LitElement {
   @state() sessionsFilterLimit = "120";
   @state() sessionsIncludeGlobal = true;
   @state() sessionsIncludeUnknown = false;
+
+  @state() tasksLoading = false;
+  @state() tasksError: string | null = null;
+  @state() tasksRunning: TaskRunSummary[] = [];
+  @state() tasksQueued: TaskRunSummary[] = [];
+  @state() tasksDone: TaskRunSummary[] = [];
+  @state() tasksScheduled: ScheduledTask[] = [];
+  @state() tasksExpandedRunId: string | null = null;
+  @state() tasksExpandedDetail: TaskRunDetail | null = null;
+  @state() tasksDetailLoading = false;
+  @state() tasksStreamEntries: Map<string, TaskStreamEntry[]> = new Map();
+  @state() tasksFilterChannels: Set<TaskSource | "all"> = new Set(["all"]);
+  @state() tasksFilterStatus: Set<SimplifiedTaskStatus | "all"> = new Set(["all"]);
+  @state() tasksFilterTimeRange: TasksFilterTimeRange = "today";
+  @state() tasksFilterQuery = "";
+  @state() tasksDoneHasMore = false;
+  @state() tasksDoneCursor: number | null = null;
+  @state() tasksLastSyncedAt: number | null = null;
+  @state() chatLastCompletedRunId: string | null = null;
 
   @state() usageLoading = false;
   @state() usageResult: import("./types.js").SessionsUsageResult | null = null;
@@ -378,6 +416,7 @@ export class OpenClawApp extends LitElement {
   private nodesPollInterval: number | null = null;
   private logsPollInterval: number | null = null;
   private debugPollInterval: number | null = null;
+  private tasksPollInterval: number | null = null;
   private logsScrollFrame: number | null = null;
   private toolStreamById = new Map<string, ToolStreamEntry>();
   private toolStreamOrder: string[] = [];
@@ -388,6 +427,13 @@ export class OpenClawApp extends LitElement {
   private themeMedia: MediaQueryList | null = null;
   private themeMediaHandler: ((event: MediaQueryListEvent) => void) | null = null;
   private topbarObserver: ResizeObserver | null = null;
+  private visibilityChangeHandler = () => {
+    if (document.visibilityState !== "visible" || this.tab !== "tasks") {
+      return;
+    }
+    void this.loadTasks();
+    void this.loadScheduled();
+  };
 
   createRenderRoot() {
     return this;
@@ -476,6 +522,46 @@ export class OpenClawApp extends LitElement {
 
   async handleAbortChat() {
     await handleAbortChatInternal(this as unknown as Parameters<typeof handleAbortChatInternal>[0]);
+  }
+
+  async loadTasks() {
+    await loadTasksInternal(this as unknown as Parameters<typeof loadTasksInternal>[0]);
+  }
+
+  async loadTaskDetail(runId: string) {
+    await loadTaskDetailInternal(
+      this as unknown as Parameters<typeof loadTaskDetailInternal>[0],
+      runId,
+    );
+  }
+
+  toggleTaskExpanded(runId: string) {
+    toggleTaskExpandedInternal(
+      this as unknown as Parameters<typeof toggleTaskExpandedInternal>[0],
+      runId,
+    );
+  }
+
+  async loadScheduled() {
+    await loadScheduledInternal(this as unknown as Parameters<typeof loadScheduledInternal>[0]);
+  }
+
+  handleTaskStreamEvent(event: TaskStreamEvent) {
+    handleTaskStreamEventInternal(
+      this as unknown as Parameters<typeof handleTaskStreamEventInternal>[0],
+      event,
+    );
+  }
+
+  applyTaskFilters(filters: Parameters<typeof applyTaskFiltersInternal>[1]) {
+    applyTaskFiltersInternal(
+      this as unknown as Parameters<typeof applyTaskFiltersInternal>[0],
+      filters,
+    );
+  }
+
+  async loadMoreDone() {
+    await loadMoreDoneInternal(this as unknown as Parameters<typeof loadMoreDoneInternal>[0]);
   }
 
   removeQueuedMessage(id: string) {

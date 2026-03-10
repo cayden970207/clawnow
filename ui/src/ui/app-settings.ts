@@ -4,6 +4,8 @@ import {
   stopLogsPolling,
   startDebugPolling,
   stopDebugPolling,
+  startTasksPolling,
+  stopTasksPolling,
 } from "./app-polling.ts";
 import { scheduleChatScroll, scheduleLogsScroll } from "./app-scroll.ts";
 import type { OpenClawApp } from "./app.ts";
@@ -26,6 +28,7 @@ import { loadNodes } from "./controllers/nodes.ts";
 import { loadPresence } from "./controllers/presence.ts";
 import { loadSessions } from "./controllers/sessions.ts";
 import { loadSkills } from "./controllers/skills.ts";
+import { loadTasks, loadScheduled } from "./controllers/tasks.ts";
 import {
   inferBasePathFromPathname,
   normalizeBasePath,
@@ -165,6 +168,11 @@ export function setTab(host: SettingsHost, next: Tab) {
   } else {
     stopDebugPolling(host as unknown as Parameters<typeof stopDebugPolling>[0]);
   }
+  if (next === "tasks") {
+    startTasksPolling(host as unknown as Parameters<typeof startTasksPolling>[0]);
+  } else {
+    stopTasksPolling(host as unknown as Parameters<typeof stopTasksPolling>[0]);
+  }
   void refreshActiveTab(host);
   syncUrlWithTab(host, next, false);
 }
@@ -190,11 +198,18 @@ export async function refreshActiveTab(host: SettingsHost) {
   if (host.tab === "channels") {
     await loadChannelsTab(host);
   }
+  if (host.tab === "whatsapp") {
+    await loadChannelsTab(host);
+  }
   if (host.tab === "instances") {
     await loadPresence(host as unknown as OpenClawApp);
   }
   if (host.tab === "sessions") {
     await loadSessions(host as unknown as OpenClawApp);
+  }
+  if (host.tab === "tasks") {
+    await loadTasks(host as unknown as OpenClawApp);
+    await loadScheduled(host as unknown as OpenClawApp);
   }
   if (host.tab === "cron") {
     await loadCron(host);
@@ -364,6 +379,11 @@ export function setTabFromRoute(host: SettingsHost, next: Tab) {
     startDebugPolling(host as unknown as Parameters<typeof startDebugPolling>[0]);
   } else {
     stopDebugPolling(host as unknown as Parameters<typeof stopDebugPolling>[0]);
+  }
+  if (next === "tasks") {
+    startTasksPolling(host as unknown as Parameters<typeof startTasksPolling>[0]);
+  } else {
+    stopTasksPolling(host as unknown as Parameters<typeof stopTasksPolling>[0]);
   }
   if (host.connected) {
     void refreshActiveTab(host);

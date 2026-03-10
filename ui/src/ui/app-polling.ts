@@ -2,11 +2,13 @@ import type { OpenClawApp } from "./app.ts";
 import { loadDebug } from "./controllers/debug.ts";
 import { loadLogs } from "./controllers/logs.ts";
 import { loadNodes } from "./controllers/nodes.ts";
+import { loadTasks, loadScheduled } from "./controllers/tasks.ts";
 
 type PollingHost = {
   nodesPollInterval: number | null;
   logsPollInterval: number | null;
   debugPollInterval: number | null;
+  tasksPollInterval: number | null;
   tab: string;
 };
 
@@ -66,4 +68,25 @@ export function stopDebugPolling(host: PollingHost) {
   }
   clearInterval(host.debugPollInterval);
   host.debugPollInterval = null;
+}
+
+export function startTasksPolling(host: PollingHost) {
+  if (host.tasksPollInterval != null) {
+    return;
+  }
+  host.tasksPollInterval = window.setInterval(() => {
+    if (host.tab !== "tasks" || document.visibilityState === "hidden") {
+      return;
+    }
+    void loadTasks(host as unknown as OpenClawApp);
+    void loadScheduled(host as unknown as OpenClawApp);
+  }, 5000);
+}
+
+export function stopTasksPolling(host: PollingHost) {
+  if (host.tasksPollInterval == null) {
+    return;
+  }
+  clearInterval(host.tasksPollInterval);
+  host.tasksPollInterval = null;
 }

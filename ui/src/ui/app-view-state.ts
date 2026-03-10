@@ -5,6 +5,7 @@ import type { DevicePairingList } from "./controllers/devices.ts";
 import type { ExecApprovalRequest } from "./controllers/exec-approval.ts";
 import type { ExecApprovalsFile, ExecApprovalsSnapshot } from "./controllers/exec-approvals.ts";
 import type { SkillMessage } from "./controllers/skills.ts";
+import type { TasksFilterTimeRange } from "./controllers/tasks.ts";
 import type { GatewayBrowserClient, GatewayHelloOk } from "./gateway.ts";
 import type { Tab } from "./navigation.ts";
 import type { UiSettings } from "./storage.ts";
@@ -32,11 +33,18 @@ import type {
   LogLevel,
   NostrProfile,
   PresenceEntry,
+  ScheduledTask,
   SessionsUsageResult,
+  SimplifiedTaskStatus,
   CostUsageSummary,
   SessionUsageTimeSeries,
   SessionsListResult,
   SkillStatusReport,
+  TaskRunSummary,
+  TaskRunDetail,
+  TaskStreamEntry,
+  TaskStreamEvent,
+  TaskSource,
   ToolsCatalogResult,
   StatusSummary,
 } from "./types.ts";
@@ -74,6 +82,7 @@ export type AppViewState = {
   fallbackStatus: FallbackStatus | null;
   chatAvatarUrl: string | null;
   chatThinkingLevel: string | null;
+  browserTaskLive: boolean;
   chatQueue: ChatQueueItem[];
   chatManualRefreshInFlight: boolean;
   nodesLoading: boolean;
@@ -163,6 +172,24 @@ export type AppViewState = {
   sessionsFilterLimit: string;
   sessionsIncludeGlobal: boolean;
   sessionsIncludeUnknown: boolean;
+  tasksLoading: boolean;
+  tasksError: string | null;
+  tasksRunning: TaskRunSummary[];
+  tasksQueued: TaskRunSummary[];
+  tasksDone: TaskRunSummary[];
+  tasksScheduled: ScheduledTask[];
+  tasksExpandedRunId: string | null;
+  tasksExpandedDetail: TaskRunDetail | null;
+  tasksDetailLoading: boolean;
+  tasksStreamEntries: Map<string, TaskStreamEntry[]>;
+  tasksFilterChannels: Set<TaskSource | "all">;
+  tasksFilterStatus: Set<SimplifiedTaskStatus | "all">;
+  tasksFilterTimeRange: TasksFilterTimeRange;
+  tasksFilterQuery: string;
+  tasksDoneHasMore: boolean;
+  tasksDoneCursor: number | null;
+  tasksLastSyncedAt: number | null;
+  chatLastCompletedRunId: string | null;
   usageLoading: boolean;
   usageResult: SessionsUsageResult | null;
   usageCostSummary: CostUsageSummary | null;
@@ -301,6 +328,18 @@ export type AppViewState = {
   handleCronFormUpdate: (path: string, value: unknown) => void;
   handleSessionsLoad: () => Promise<void>;
   handleSessionsPatch: (key: string, patch: unknown) => Promise<void>;
+  loadTasks: () => Promise<void>;
+  loadTaskDetail: (runId: string) => Promise<void>;
+  toggleTaskExpanded: (runId: string) => void;
+  loadScheduled: () => Promise<void>;
+  handleTaskStreamEvent: (event: TaskStreamEvent) => void;
+  applyTaskFilters: (filters: {
+    channels?: Set<TaskSource | "all">;
+    status?: Set<SimplifiedTaskStatus | "all">;
+    timeRange?: TasksFilterTimeRange;
+    query?: string;
+  }) => void;
+  loadMoreDone: () => Promise<void>;
   handleLoadNodes: () => Promise<void>;
   handleLoadPresence: () => Promise<void>;
   handleLoadSkills: () => Promise<void>;

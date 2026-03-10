@@ -27,6 +27,7 @@ import {
 } from "./controllers/exec-approval.ts";
 import { loadNodes } from "./controllers/nodes.ts";
 import { loadSessions } from "./controllers/sessions.ts";
+import { loadTasks, loadScheduled, handleTaskStreamEvent } from "./controllers/tasks.ts";
 import {
   resolveGatewayErrorDetailCode,
   type GatewayEventFrame,
@@ -40,6 +41,7 @@ import type {
   PresenceEntry,
   HealthSnapshot,
   StatusSummary,
+  TaskStreamEvent,
   UpdateAvailable,
 } from "./types.ts";
 
@@ -72,6 +74,9 @@ type GatewayHost = {
   sessionKey: string;
   chatRunId: string | null;
   refreshSessionsAfterChat: Set<string>;
+  tasksLoading: boolean;
+  tasksSyncTimer?: number | null;
+  chatLastCompletedRunId: string | null;
   execApprovalQueue: ExecApprovalRequest[];
   execApprovalError: string | null;
   updateAvailable: UpdateAvailable | null;
@@ -156,6 +161,10 @@ export function connectGateway(host: GatewayHost) {
       if (host.client !== client) {
         return;
       }
+      if (host.tasksSyncTimer != null) {
+        window.clearTimeout(host.tasksSyncTimer);
+        host.tasksSyncTimer = null;
+      }
       host.connected = true;
       host.lastError = null;
       host.lastErrorCode = null;
@@ -177,6 +186,10 @@ export function connectGateway(host: GatewayHost) {
     onClose: ({ code, reason, error }) => {
       if (host.client !== client) {
         return;
+      }
+      if (host.tasksSyncTimer != null) {
+        window.clearTimeout(host.tasksSyncTimer);
+        host.tasksSyncTimer = null;
       }
       host.connected = false;
       // Code 1012 = Service Restart (expected during config saves, don't show as error)
@@ -232,6 +245,9 @@ function handleTerminalChatEvent(
   resetToolStream(host as unknown as Parameters<typeof resetToolStream>[0]);
   void flushChatQueueForEvent(host as unknown as Parameters<typeof flushChatQueueForEvent>[0]);
   const runId = payload?.runId;
+  if (runId && (state === "final" || state === "error" || state === "aborted")) {
+    host.chatLastCompletedRunId = runId;
+  }
   if (!runId || !host.refreshSessionsAfterChat.has(runId)) {
     return;
   }
@@ -241,6 +257,18 @@ function handleTerminalChatEvent(
       activeMinutes: CHAT_SESSIONS_ACTIVE_MINUTES,
     });
   }
+}
+
+function scheduleTasksRefresh(host: GatewayHost) {
+  if (host.tasksSyncTimer != null) {
+    window.clearTimeout(host.tasksSyncTimer);
+    host.tasksSyncTimer = null;
+  }
+  host.tasksSyncTimer = window.setTimeout(() => {
+    host.tasksSyncTimer = null;
+    void loadTasks(host as unknown as OpenClawApp);
+    void loadScheduled(host as unknown as OpenClawApp);
+  }, 320);
 }
 
 function handleChatGatewayEvent(host: GatewayHost, payload: ChatEventPayload | undefined) {
@@ -274,6 +302,9 @@ function handleGatewayEventUnsafe(host: GatewayHost, evt: GatewayEventFrame) {
       host as unknown as Parameters<typeof handleAgentEvent>[0],
       evt.payload as AgentEventPayload | undefined,
     );
+    if (host.tab === "tasks") {
+      scheduleTasksRefresh(host);
+    }
     return;
   }
 
@@ -324,6 +355,16 @@ function handleGatewayEventUnsafe(host: GatewayHost, evt: GatewayEventFrame) {
   if (evt.event === GATEWAY_EVENT_UPDATE_AVAILABLE) {
     const payload = evt.payload as GatewayUpdateAvailableEventPayload | undefined;
     host.updateAvailable = payload?.updateAvailable ?? null;
+  }
+
+  if (evt.event === "task.stream") {
+    const payload = evt.payload as TaskStreamEvent | undefined;
+    if (payload) {
+      handleTaskStreamEvent(host as unknown as OpenClawApp, payload);
+    }
+    if (host.tab === "tasks") {
+      scheduleTasksRefresh(host);
+    }
   }
 }
 

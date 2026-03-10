@@ -47,7 +47,32 @@ function resetChatStateForSessionSwitch(state: AppViewState, sessionKey: string)
   });
 }
 
+function resolveDesktopLiveUrl(): string | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  const target = new URL("/novnc/vnc.html", window.location.origin);
+  target.searchParams.set("autoconnect", "1");
+  target.searchParams.set("reconnect", "true");
+  target.searchParams.set("reconnect_delay", "1000");
+  target.searchParams.set("resize", "remote");
+  // ClawNow proxy serves noVNC under /novnc and routes websocket via /novnc/websockify.
+  target.searchParams.set("path", "novnc/websockify");
+  return target.toString();
+}
+
+function isTasksFeatureEnabled(state: AppViewState): boolean {
+  const methods = state.hello?.features?.methods;
+  if (!Array.isArray(methods) || methods.length === 0) {
+    return true;
+  }
+  return methods.includes("tasks.list") && methods.includes("tasks.get");
+}
+
 export function renderTab(state: AppViewState, tab: Tab) {
+  if (tab === "tasks" && !isTasksFeatureEnabled(state)) {
+    return null;
+  }
   const href = pathForTab(tab, state.basePath);
   return html`
     <a
@@ -89,6 +114,7 @@ export function renderChatControls(state: AppViewState) {
     state.sessionsResult,
     mainSessionKey,
   );
+  const desktopLiveUrl = resolveDesktopLiveUrl();
   const disableThinkingToggle = state.onboarding;
   const disableFocusToggle = state.onboarding;
   const showThinking = state.onboarding ? false : state.settings.chatShowThinking;
@@ -191,6 +217,43 @@ export function renderChatControls(state: AppViewState) {
       >
         ${refreshIcon}
       </button>
+      <button
+        class="btn btn--sm"
+        ?disabled=${!desktopLiveUrl}
+        @click=${() => {
+          if (!desktopLiveUrl) {
+            state.lastError = t("chat.desktopLiveUnavailable");
+            return;
+          }
+          const popup = window.open(desktopLiveUrl, "_blank");
+          if (popup) {
+            popup.opener = null;
+            state.lastError = null;
+          } else {
+            state.lastError = t("chat.desktopLivePopupBlocked");
+          }
+        }}
+        title=${desktopLiveUrl ? t("chat.openDesktopLiveTitle") : t("chat.desktopLiveUnavailable")}
+      >
+        ${icons.monitor}
+        <span>${t("chat.openDesktopLive")}</span>
+      </button>
+      ${
+        state.chatLastCompletedRunId
+          ? html`
+              <button
+                class="btn btn--sm"
+                @click=${() => {
+                  state.setTab("tasks");
+                  void state.loadTasks();
+                }}
+                title="Open this run in Tasks board"
+              >
+                <span>View in Tasks</span>
+              </button>
+            `
+          : null
+      }
       <span class="chat-controls__separator">|</span>
       <button
         class="btn btn--sm btn--icon ${showThinking ? "active" : ""}"
