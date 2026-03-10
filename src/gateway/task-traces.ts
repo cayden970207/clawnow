@@ -60,6 +60,25 @@ export function toSimplifiedStatus(status: TaskStatus): SimplifiedTaskStatus {
   }
 }
 
+export type TaskStep = { tool: string; result: string; phase: string };
+
+export function extractSteps(nodes: TaskNode[]): TaskStep[] {
+  return nodes
+    .filter((n) => n.type === "tool" || n.type === "assistant")
+    .map((n) => ({
+      tool: n.label,
+      result: n.summary ?? "",
+      phase: n.status === "error" ? "error" : "result",
+    }));
+}
+
+export function extractErrorReason(nodes: TaskNode[]): string | undefined {
+  const errorNode = nodes.find(
+    (n) => n.status === "error" || n.status === "timeout" || n.status === "aborted",
+  );
+  return errorNode?.summary;
+}
+
 export type TaskNodeType = "trigger" | "plan" | "tool" | "assistant" | "finalize";
 
 export type TaskEdgeType = "sequence" | "branch" | "retry";

@@ -2,7 +2,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { TaskTraceStore, toSimplifiedStatus, type TaskTraceLogger } from "./task-traces.js";
+import {
+  TaskTraceStore,
+  extractErrorReason,
+  extractSteps,
+  toSimplifiedStatus,
+  type TaskNode,
+  type TaskTraceLogger,
+} from "./task-traces.js";
 
 function createLogger(): TaskTraceLogger {
   return {
@@ -20,6 +27,82 @@ describe("toSimplifiedStatus", () => {
     expect(toSimplifiedStatus("error")).toBe("failed");
     expect(toSimplifiedStatus("aborted")).toBe("failed");
     expect(toSimplifiedStatus("timeout")).toBe("failed");
+  });
+});
+
+describe("extractSteps", () => {
+  it("extracts tool and assistant steps from nodes", () => {
+    const nodes: TaskNode[] = [
+      { id: "n1", type: "trigger", label: "User message", status: "success", startedAt: 1000 },
+      {
+        id: "n2",
+        type: "tool",
+        label: "web_search",
+        status: "success",
+        startedAt: 1001,
+        summary: "Found 12 results",
+      },
+      {
+        id: "n3",
+        type: "tool",
+        label: "browse",
+        status: "success",
+        startedAt: 1002,
+        summary: "Extracted fare data",
+      },
+      {
+        id: "n4",
+        type: "assistant",
+        label: "reply",
+        status: "success",
+        startedAt: 1003,
+        summary: "Sent flight options",
+      },
+      { id: "n5", type: "finalize", label: "done", status: "success", startedAt: 1004 },
+    ];
+    const steps = extractSteps(nodes);
+    expect(steps).toHaveLength(3);
+    expect(steps[0]).toEqual({ tool: "web_search", result: "Found 12 results", phase: "result" });
+    expect(steps[2]).toEqual({ tool: "reply", result: "Sent flight options", phase: "result" });
+  });
+
+  it("marks error steps with error phase", () => {
+    const nodes: TaskNode[] = [
+      {
+        id: "n1",
+        type: "tool",
+        label: "db_query",
+        status: "error",
+        startedAt: 1000,
+        summary: "Connection timeout",
+      },
+    ];
+    const steps = extractSteps(nodes);
+    expect(steps[0].phase).toBe("error");
+  });
+});
+
+describe("extractErrorReason", () => {
+  it("returns summary from first error node", () => {
+    const nodes: TaskNode[] = [
+      { id: "n1", type: "tool", label: "web_search", status: "success", startedAt: 1000 },
+      {
+        id: "n2",
+        type: "tool",
+        label: "db_query",
+        status: "error",
+        startedAt: 1001,
+        summary: "Connection timeout",
+      },
+    ];
+    expect(extractErrorReason(nodes)).toBe("Connection timeout");
+  });
+
+  it("returns undefined when no error nodes", () => {
+    const nodes: TaskNode[] = [
+      { id: "n1", type: "tool", label: "web_search", status: "success", startedAt: 1000 },
+    ];
+    expect(extractErrorReason(nodes)).toBeUndefined();
   });
 });
 
