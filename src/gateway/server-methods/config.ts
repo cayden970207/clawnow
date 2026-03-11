@@ -20,11 +20,7 @@ import {
 import { buildConfigSchema, type ConfigSchemaResponse } from "../../config/schema.js";
 import { extractDeliveryInfo } from "../../config/sessions.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import {
-  formatDoctorNonInteractiveHint,
-  type RestartSentinelPayload,
-  writeRestartSentinel,
-} from "../../infra/restart-sentinel.js";
+import { type RestartSentinelPayload, writeRestartSentinel } from "../../infra/restart-sentinel.js";
 import { scheduleGatewaySigusr1Restart } from "../../infra/restart.js";
 import { loadOpenClawPlugins } from "../../plugins/loader.js";
 import { diffConfigPaths } from "../config-reload.js";
@@ -198,7 +194,6 @@ function buildConfigRestartSentinelPayload(params: {
     deliveryContext: params.deliveryContext,
     threadId: params.threadId,
     message: params.note ?? null,
-    doctorHint: formatDoctorNonInteractiveHint(),
     stats: {
       mode: params.mode,
       root: CONFIG_PATH,
@@ -294,6 +289,10 @@ function preserveTrustedProxyGatewayDefaults(
     nextConfig.gateway.controlUi = nextConfig.gateway.controlUi || {};
     nextConfig.gateway.controlUi.basePath ??= snapshotGateway.controlUi.basePath;
     nextConfig.gateway.controlUi.root ??= snapshotGateway.controlUi.root;
+    if (snapshotGateway.controlUi.features) {
+      nextConfig.gateway.controlUi.features = nextConfig.gateway.controlUi.features || {};
+      nextConfig.gateway.controlUi.features.tasks ??= snapshotGateway.controlUi.features.tasks;
+    }
     nextConfig.gateway.controlUi.allowedOrigins ??= snapshotGateway.controlUi.allowedOrigins;
     if (nextConfig.gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback === undefined) {
       nextConfig.gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback =

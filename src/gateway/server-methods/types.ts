@@ -11,6 +11,7 @@ import type { ConnectParams, ErrorShape, RequestFrame } from "../protocol/index.
 import type { GatewayBroadcastFn, GatewayBroadcastToConnIdsFn } from "../server-broadcast.js";
 import type { ChannelRuntimeSnapshot } from "../server-channels.js";
 import type { DedupeEntry } from "../server-shared.js";
+import type { TaskTraceStore } from "../task-traces.js";
 
 type SubsystemLogger = ReturnType<typeof createSubsystemLogger>;
 
@@ -85,6 +86,8 @@ export type GatewayRequestContext = {
     prompter: import("../../wizard/prompts.js").WizardPrompter,
   ) => Promise<void>;
   broadcastVoiceWakeChanged: (triggers: string[]) => void;
+  taskTraces: TaskTraceStore;
+  tasksFeatureEnabled: boolean;
 };
 
 export type GatewayRequestOptions = {

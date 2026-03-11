@@ -68,6 +68,11 @@ export type GatewayControlUiConfig = {
   basePath?: string;
   /** Optional filesystem root for Control UI assets (defaults to dist/control-ui). */
   root?: string;
+  /** Optional feature flags for Control UI surfaces. */
+  features?: {
+    /** Enable Tasks board UI and related gateway methods (default: true). */
+    tasks?: boolean;
+  };
   /** Allowed browser origins for Control UI/WebChat websocket connections. */
   allowedOrigins?: string[];
   /**

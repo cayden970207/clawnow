@@ -129,6 +129,17 @@ import type {
 } from "./sessions.js";
 import type { PresenceEntrySchema, SnapshotSchema, StateVersionSchema } from "./snapshot.js";
 import type {
+  TaskEdgeSchema,
+  TaskNodeSchema,
+  TaskRunDetailSchema,
+  TaskRunSummarySchema,
+  TaskTimelineEntrySchema,
+  TasksGetParamsSchema,
+  TasksGetResultSchema,
+  TasksListParamsSchema,
+  TasksListResultSchema,
+} from "./tasks.js";
+import type {
   WizardCancelParamsSchema,
   WizardNextParamsSchema,
   WizardNextResultSchema,
@@ -176,6 +187,15 @@ export type SessionsResetParams = Static<typeof SessionsResetParamsSchema>;
 export type SessionsDeleteParams = Static<typeof SessionsDeleteParamsSchema>;
 export type SessionsCompactParams = Static<typeof SessionsCompactParamsSchema>;
 export type SessionsUsageParams = Static<typeof SessionsUsageParamsSchema>;
+export type TaskRunSummary = Static<typeof TaskRunSummarySchema>;
+export type TaskNode = Static<typeof TaskNodeSchema>;
+export type TaskEdge = Static<typeof TaskEdgeSchema>;
+export type TaskTimelineEntry = Static<typeof TaskTimelineEntrySchema>;
+export type TaskRunDetail = Static<typeof TaskRunDetailSchema>;
+export type TasksListParams = Static<typeof TasksListParamsSchema>;
+export type TasksListResult = Static<typeof TasksListResultSchema>;
+export type TasksGetParams = Static<typeof TasksGetParamsSchema>;
+export type TasksGetResult = Static<typeof TasksGetResultSchema>;
 export type ConfigGetParams = Static<typeof ConfigGetParamsSchema>;
 export type ConfigSetParams = Static<typeof ConfigSetParamsSchema>;
 export type ConfigApplyParams = Static<typeof ConfigApplyParamsSchema>;

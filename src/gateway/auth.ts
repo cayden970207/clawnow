@@ -63,6 +63,7 @@ export type AuthorizeGatewayConnectParams = {
   connectAuth?: ConnectAuth | null;
   req?: IncomingMessage;
   trustedProxies?: string[];
+  env?: NodeJS.ProcessEnv;
   tailscaleWhois?: TailscaleWhoisLookup;
   /**
    * Explicit auth surface. HTTP keeps Tailscale forwarded-header auth disabled.
@@ -133,19 +134,30 @@ export function isLocalDirectRequest(
   if (!req) {
     return false;
   }
-  const clientIp = resolveRequestClientIp(req, trustedProxies, allowRealIpFallback) ?? "";
-  if (!isLoopbackAddress(clientIp)) {
+  const hostIsLocal = isLocalishHost(req.headers?.host);
+  if (!hostIsLocal) {
     return false;
   }
-
   const hasForwarded = Boolean(
     req.headers?.["x-forwarded-for"] ||
     req.headers?.["x-real-ip"] ||
     req.headers?.["x-forwarded-host"],
   );
 
+  // Direct local clients (CLI/tools on the same VM) may hit the gateway on
+  // loopback without any forwarded headers. Treat these as local-direct even
+  // when loopback is listed in trustedProxies.
+  if (!hasForwarded && isLoopbackAddress(req.socket?.remoteAddress ?? "")) {
+    return true;
+  }
+
+  const clientIp = resolveRequestClientIp(req, trustedProxies, allowRealIpFallback) ?? "";
+  if (!isLoopbackAddress(clientIp)) {
+    return false;
+  }
+
   const remoteIsTrustedProxy = isTrustedProxyAddress(req.socket?.remoteAddress, trustedProxies);
-  return isLocalishHost(req.headers?.host) && (!hasForwarded || remoteIsTrustedProxy);
+  return !hasForwarded || remoteIsTrustedProxy;
 }
 
 function getTailscaleUser(req?: IncomingMessage): TailscaleUser | null {
@@ -387,6 +399,12 @@ export async function authorizeGatewayConnect(
   );
 
   if (auth.mode === "trusted-proxy") {
+    // Local loopback direct requests are trusted as same-host calls. This keeps
+    // local CLI/doctor/browser probes functional when they bypass proxy headers.
+    if (localDirect) {
+      return { ok: true, method: "trusted-proxy", user: "loopback@local" };
+    }
+
     if (!auth.trustedProxy) {
       return { ok: false, reason: "trusted_proxy_config_missing" };
     }

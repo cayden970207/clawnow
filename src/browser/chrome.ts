@@ -46,6 +46,26 @@ function exists(filePath: string) {
   }
 }
 
+function captureProcessOutputTail(
+  proc: ChildProcessWithoutNullStreams,
+  maxChars = 1400,
+): () => string {
+  let tail = "";
+  const append = (chunk: unknown) => {
+    const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String((chunk as string) ?? "");
+    if (!text) {
+      return;
+    }
+    tail = `${tail}${text}`;
+    if (tail.length > maxChars) {
+      tail = tail.slice(-maxChars);
+    }
+  };
+  proc.stdout.on("data", append);
+  proc.stderr.on("data", append);
+  return () => tail.trim();
+}
+
 export type RunningChrome = {
   pid: number;
   exe: BrowserExecutable;
@@ -208,7 +228,6 @@ export async function launchOpenClawChrome(
     }
     if (resolved.noSandbox) {
       args.push("--no-sandbox");
-      args.push("--disable-setuid-sandbox");
     }
     if (process.platform === "linux") {
       args.push("--disable-dev-shm-usage");
@@ -285,8 +304,11 @@ export async function launchOpenClawChrome(
   }
 
   const proc = spawnOnce();
+  const readOutputTail = captureProcessOutputTail(proc);
   // Wait for CDP to come up.
-  const readyDeadline = Date.now() + 15_000;
+  // First launch on fresh VMs can be slow (profile bootstrap + desktop startup).
+  // Give Chrome more time before treating it as a hard failure.
+  const readyDeadline = Date.now() + 45_000;
   while (Date.now() < readyDeadline) {
     if (await isChromeReachable(profile.cdpUrl, 500)) {
       break;
@@ -295,13 +317,15 @@ export async function launchOpenClawChrome(
   }
 
   if (!(await isChromeReachable(profile.cdpUrl, 500))) {
+    const outputTail = readOutputTail();
     try {
       proc.kill("SIGKILL");
     } catch {
       // ignore
     }
+    const outputHint = outputTail ? ` Last browser output: ${outputTail}` : "";
     throw new Error(
-      `Failed to start Chrome CDP on port ${profile.cdpPort} for profile "${profile.name}".`,
+      `Failed to start Chrome CDP on port ${profile.cdpPort} for profile "${profile.name}".${outputHint}`,
     );
   }
 

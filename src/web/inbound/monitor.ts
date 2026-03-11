@@ -8,6 +8,7 @@ import { getChildLogger } from "../../logging/logger.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { saveMediaBuffer } from "../../media/store.js";
 import { jidToE164, resolveJidToE164 } from "../../utils.js";
+import type { ActiveWebDirectoryGroup } from "../active-listener.js";
 import { createWaSocket, getStatusCode, waitForWaConnection } from "../session.js";
 import { checkInboundAccessControl } from "./access-control.js";
 import { isRecentInboundMessage } from "./dedupe.js";
@@ -21,7 +22,6 @@ import {
 import { downloadInboundMedia } from "./media.js";
 import { createWebSendApi } from "./send-api.js";
 import type { WebInboundMessage, WebListenerCloseReason } from "./types.js";
-import type { ActiveWebDirectoryGroup } from "../active-listener.js";
 
 function toTrimmedString(value: unknown): string | null {
   if (typeof value !== "string") {
@@ -40,7 +40,9 @@ function parseLiveGroupsPayload(payload: unknown): ActiveWebDirectoryGroup[] {
   const subjectById = new Map<string, string>();
   for (const [key, raw] of Object.entries(payload as Record<string, unknown>)) {
     const group =
-      raw && typeof raw === "object" ? (raw as Record<string, unknown>) : ({} as Record<string, unknown>);
+      raw && typeof raw === "object"
+        ? (raw as Record<string, unknown>)
+        : ({} as Record<string, unknown>);
     const id = toTrimmedString(group.id) ?? toTrimmedString(key);
     if (!id || !id.endsWith("@g.us")) {
       continue;

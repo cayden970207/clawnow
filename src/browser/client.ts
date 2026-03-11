@@ -1,5 +1,9 @@
 import { fetchBrowserJson } from "./client-fetch.js";
 
+const BROWSER_START_TIMEOUT_MS = 45_000;
+const BROWSER_OPEN_TIMEOUT_MS = 45_000;
+const BROWSER_STOP_TIMEOUT_MS = 20_000;
+
 export type BrowserStatus = {
   enabled: boolean;
   profile?: string;
@@ -122,7 +126,7 @@ export async function browserStart(baseUrl?: string, opts?: { profile?: string }
   const q = buildProfileQuery(opts?.profile);
   await fetchBrowserJson(withBaseUrl(baseUrl, `/start${q}`), {
     method: "POST",
-    timeoutMs: 15000,
+    timeoutMs: BROWSER_START_TIMEOUT_MS,
   });
 }
 
@@ -130,7 +134,7 @@ export async function browserStop(baseUrl?: string, opts?: { profile?: string })
   const q = buildProfileQuery(opts?.profile);
   await fetchBrowserJson(withBaseUrl(baseUrl, `/stop${q}`), {
     method: "POST",
-    timeoutMs: 15000,
+    timeoutMs: BROWSER_STOP_TIMEOUT_MS,
   });
 }
 
@@ -223,7 +227,7 @@ export async function browserOpenTab(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ url }),
-    timeoutMs: 15000,
+    timeoutMs: BROWSER_OPEN_TIMEOUT_MS,
   });
 }
 

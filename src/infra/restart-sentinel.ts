@@ -121,9 +121,6 @@ export function formatRestartSentinelMessage(payload: RestartSentinelPayload): s
   if (reason) {
     lines.push(`Reason: ${reason}`);
   }
-  if (payload.doctorHint?.trim()) {
-    lines.push(payload.doctorHint.trim());
-  }
   return lines.join("\n");
 }
 

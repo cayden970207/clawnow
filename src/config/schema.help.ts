@@ -69,6 +69,10 @@ export const FIELD_HELP: Record<string, string> = {
     "Control UI hosting settings including enablement, pathing, and browser-origin/auth hardening behavior. Keep UI exposure minimal and pair with strong auth controls before internet-facing deployments.",
   "gateway.controlUi.enabled":
     "Enables serving the gateway Control UI from the gateway HTTP process when true. Keep enabled for local administration, and disable when an external control surface replaces it.",
+  "gateway.controlUi.features":
+    "Optional feature switches for Control UI sections so operators can progressively roll out surfaces per deployment.",
+  "gateway.controlUi.features.tasks":
+    "Enables the Tasks board in Control UI and its supporting read-only task trace APIs. Keep enabled for task visibility, or disable to hide task visualization surfaces.",
   "gateway.auth":
     "Authentication policy for gateway HTTP/WebSocket access including mode, credentials, trusted-proxy behavior, and rate limiting. Keep auth enabled for every non-loopback deployment.",
   "gateway.auth.mode":

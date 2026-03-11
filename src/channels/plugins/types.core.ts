@@ -141,11 +141,20 @@ export type ChannelAccountSnapshot = {
   lastProbeAt?: number | null;
   audit?: unknown;
   application?: unknown;
+  directoryGroups?: ChannelDirectoryGroupSnapshot[];
   bot?: unknown;
   publicKey?: string | null;
   profile?: unknown;
   channelAccessToken?: string;
   channelSecret?: string;
+};
+
+export type ChannelDirectoryGroupSnapshot = {
+  id: string;
+  name?: string;
+  communityJid?: string;
+  communityName?: string;
+  source?: string;
 };
 
 export type ChannelLogSink = {

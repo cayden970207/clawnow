@@ -536,4 +536,52 @@ describe("trusted-proxy auth", () => {
     expect(res.ok).toBe(true);
     expect(res.user).toBe("nick@example.com");
   });
+
+  it("allows loopback direct auth in trusted-proxy mode", async () => {
+    const res = await authorizeGatewayConnect({
+      auth: {
+        mode: "trusted-proxy",
+        allowTailscale: false,
+        trustedProxy: {
+          userHeader: "x-forwarded-user",
+          requiredHeaders: ["x-clawnow-verified"],
+        },
+      },
+      connectAuth: null,
+      trustedProxies: ["127.0.0.1", "::1"],
+      req: {
+        socket: { remoteAddress: "127.0.0.1" },
+        headers: { host: "127.0.0.1:18789" },
+      } as never,
+    });
+
+    expect(res.ok).toBe(true);
+    expect(res.method).toBe("trusted-proxy");
+    expect(res.user).toBe("loopback@local");
+  });
+
+  it("keeps requiring trusted-proxy headers for proxied requests", async () => {
+    const res = await authorizeGatewayConnect({
+      auth: {
+        mode: "trusted-proxy",
+        allowTailscale: false,
+        trustedProxy: {
+          userHeader: "x-forwarded-user",
+          requiredHeaders: ["x-clawnow-verified"],
+        },
+      },
+      connectAuth: null,
+      trustedProxies: ["127.0.0.1", "::1"],
+      req: {
+        socket: { remoteAddress: "127.0.0.1" },
+        headers: {
+          host: "127.0.0.1:18789",
+          "x-forwarded-for": "10.0.0.20",
+        },
+      } as never,
+    });
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("trusted_proxy_missing_header_x-clawnow-verified");
+  });
 });

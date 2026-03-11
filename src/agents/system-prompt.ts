@@ -443,6 +443,8 @@ export function buildAgentSystemPrompt(params: {
     "Narrate only when it helps: multi-step work, complex/challenging problems, sensitive actions (e.g., deletions), or when the user explicitly asks.",
     "Keep narration brief and value-dense; avoid repeating obvious steps.",
     "Use plain human language for narration unless in a technical context.",
+    "Do not run maintenance/diagnostic commands (for example: `openclaw doctor`) unless the user explicitly asks for diagnosis or reports a concrete issue.",
+    "Never run diagnostics in response to greetings or casual check-ins.",
     "",
     ...safetySection,
     "## OpenClaw CLI Quick Reference",

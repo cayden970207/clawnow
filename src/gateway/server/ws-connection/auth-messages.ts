@@ -26,6 +26,18 @@ export function formatGatewayAuthFailureMessage(params: {
       ? "enter the password in Control UI settings"
       : "provide gateway auth password";
   switch (reason) {
+    case "trusted_proxy_no_request":
+      return "unauthorized: trusted-proxy request context missing";
+    case "trusted_proxy_untrusted_source":
+      return "unauthorized: trusted-proxy source not trusted (check gateway.trustedProxies)";
+    case "trusted_proxy_user_missing":
+      return "unauthorized: trusted-proxy user header missing";
+    case "trusted_proxy_user_not_allowed":
+      return "unauthorized: trusted-proxy user not allowed";
+    case "trusted_proxy_config_missing":
+      return "unauthorized: trusted-proxy config missing on gateway";
+    case "trusted_proxy_no_proxies_configured":
+      return "unauthorized: trusted-proxy trustedProxies missing on gateway";
     case "token_missing":
       return `unauthorized: gateway token missing (${tokenHint})`;
     case "token_mismatch":
@@ -52,6 +64,11 @@ export function formatGatewayAuthFailureMessage(params: {
       return "unauthorized: device token mismatch (rotate/reissue device token)";
     default:
       break;
+  }
+
+  if (reason?.startsWith("trusted_proxy_missing_header_")) {
+    const header = reason.slice("trusted_proxy_missing_header_".length);
+    return `unauthorized: trusted-proxy header missing (${header})`;
   }
 
   if (authMode === "token" && authProvided === "none") {
