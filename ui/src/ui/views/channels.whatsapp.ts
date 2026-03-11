@@ -52,6 +52,14 @@ export function renderWhatsAppCard(params: {
             ${whatsapp?.authAgeMs != null ? formatDurationHuman(whatsapp.authAgeMs) : "n/a"}
           </span>
         </div>
+        <div>
+          <span class="label">Self phone</span>
+          <span>${whatsapp?.self?.e164 ?? "n/a"}</span>
+        </div>
+        <div>
+          <span class="label">Self JID</span>
+          <span class="mono">${whatsapp?.self?.jid ?? "n/a"}</span>
+        </div>
       </div>
 
       ${

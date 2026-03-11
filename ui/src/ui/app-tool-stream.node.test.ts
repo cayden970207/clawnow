@@ -7,6 +7,7 @@ type MutableHost = ToolStreamHost & {
   compactionClearTimer?: number | null;
   fallbackStatus?: FallbackStatus | null;
   fallbackClearTimer?: number | null;
+  browserTaskLive?: boolean;
 };
 
 function createHost(overrides?: Partial<MutableHost>): MutableHost {
@@ -17,6 +18,7 @@ function createHost(overrides?: Partial<MutableHost>): MutableHost {
     toolStreamOrder: [],
     chatToolMessages: [],
     toolStreamSyncTimer: null,
+    browserTaskLive: false,
     compactionStatus: null,
     compactionClearTimer: null,
     fallbackStatus: null,
@@ -135,5 +137,87 @@ describe("app-tool-stream fallback lifecycle handling", () => {
     expect(host.fallbackStatus?.phase).toBe("cleared");
     expect(host.fallbackStatus?.previous).toBe("deepinfra/moonshotai/Kimi-K2.5");
     vi.useRealTimers();
+  });
+
+  it("keeps browserTaskLive on after browser activity until an explicit stop", () => {
+    const host = createHost({ chatRunId: "run-1" });
+
+    handleAgentEvent(host, {
+      runId: "run-1",
+      seq: 1,
+      stream: "tool",
+      ts: Date.now(),
+      sessionKey: "main",
+      data: {
+        toolCallId: "call-1",
+        name: "browser.navigate",
+        phase: "start",
+      },
+    });
+    expect(host.browserTaskLive).toBe(true);
+
+    handleAgentEvent(host, {
+      runId: "run-1",
+      seq: 2,
+      stream: "tool",
+      ts: Date.now(),
+      sessionKey: "main",
+      data: {
+        toolCallId: "call-1",
+        name: "browser.navigate",
+        phase: "result",
+      },
+    });
+    expect(host.browserTaskLive).toBe(true);
+
+    handleAgentEvent(host, {
+      runId: "run-1",
+      seq: 3,
+      stream: "tool",
+      ts: Date.now(),
+      sessionKey: "main",
+      data: {
+        toolCallId: "call-2",
+        name: "browser",
+        phase: "start",
+        args: { action: "stop" },
+      },
+    });
+    expect(host.browserTaskLive).toBe(true);
+
+    handleAgentEvent(host, {
+      runId: "run-1",
+      seq: 4,
+      stream: "tool",
+      ts: Date.now(),
+      sessionKey: "main",
+      data: {
+        toolCallId: "call-2",
+        name: "browser",
+        phase: "result",
+        isError: false,
+        result: { details: { running: false } },
+      },
+    });
+    expect(host.browserTaskLive).toBe(false);
+  });
+
+  it("does not mark browserTaskLive for non-browser tool calls", () => {
+    const host = createHost({ chatRunId: "run-1" });
+
+    handleAgentEvent(host, {
+      runId: "run-1",
+      seq: 1,
+      stream: "tool",
+      ts: Date.now(),
+      sessionKey: "main",
+      data: {
+        toolCallId: "call-2",
+        name: "web.search",
+        phase: "start",
+      },
+    });
+
+    expect(host.browserTaskLive).toBe(false);
   });
 });

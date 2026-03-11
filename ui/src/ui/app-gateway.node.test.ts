@@ -5,6 +5,7 @@ import { connectGateway } from "./app-gateway.ts";
 type GatewayClientMock = {
   start: ReturnType<typeof vi.fn>;
   stop: ReturnType<typeof vi.fn>;
+  connectOpts: Record<string, unknown>;
   emitClose: (info: {
     code: number;
     reason?: string;
@@ -34,6 +35,7 @@ vi.mock("./gateway.ts", () => {
 
     constructor(
       private opts: {
+        caps?: string[];
         onClose?: (info: {
           code: number;
           reason: string;
@@ -46,6 +48,7 @@ vi.mock("./gateway.ts", () => {
       gatewayClientInstances.push({
         start: this.start,
         stop: this.stop,
+        connectOpts: this.opts as unknown as Record<string, unknown>,
         emitClose: (info) => {
           this.opts.onClose?.({
             code: info.code,
@@ -132,6 +135,15 @@ describe("connectGateway", () => {
     expect(host.lastError).toBe(
       "event gap detected (expected seq 20, got 24); refresh recommended",
     );
+  });
+
+  it("requests tool-events capability on connect", () => {
+    const host = createHost();
+    connectGateway(host);
+    const client = gatewayClientInstances[0];
+    expect(client).toBeDefined();
+    const caps = client.connectOpts.caps;
+    expect(Array.isArray(caps) ? caps : []).toContain("tool-events");
   });
 
   it("ignores stale client onEvent callbacks after reconnect", () => {

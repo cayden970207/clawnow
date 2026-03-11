@@ -6,6 +6,8 @@ import {
   stopNodesPolling,
   startDebugPolling,
   stopDebugPolling,
+  startTasksPolling,
+  stopTasksPolling,
 } from "./app-polling.ts";
 import { observeTopbar, scheduleChatScroll, scheduleLogsScroll } from "./app-scroll.ts";
 import {
@@ -32,10 +34,12 @@ type LifecycleHost = {
   chatLoading: boolean;
   chatMessages: unknown[];
   chatToolMessages: unknown[];
-  chatStream: string;
+  chatStream: string | null;
+  tasksPollInterval: number | null;
   logsAutoFollow: boolean;
   logsAtBottom: boolean;
   logsEntries: unknown[];
+  visibilityChangeHandler: () => void;
   popStateHandler: () => void;
   topbarObserver: ResizeObserver | null;
 };
@@ -48,6 +52,7 @@ export function handleConnected(host: LifecycleHost) {
   syncThemeWithSettings(host as unknown as Parameters<typeof syncThemeWithSettings>[0]);
   attachThemeListener(host as unknown as Parameters<typeof attachThemeListener>[0]);
   window.addEventListener("popstate", host.popStateHandler);
+  document.addEventListener("visibilitychange", host.visibilityChangeHandler);
   connectGateway(host as unknown as Parameters<typeof connectGateway>[0]);
   startNodesPolling(host as unknown as Parameters<typeof startNodesPolling>[0]);
   if (host.tab === "logs") {
@@ -55,6 +60,9 @@ export function handleConnected(host: LifecycleHost) {
   }
   if (host.tab === "debug") {
     startDebugPolling(host as unknown as Parameters<typeof startDebugPolling>[0]);
+  }
+  if (host.tab === "tasks") {
+    startTasksPolling(host as unknown as Parameters<typeof startTasksPolling>[0]);
   }
 }
 
@@ -64,9 +72,11 @@ export function handleFirstUpdated(host: LifecycleHost) {
 
 export function handleDisconnected(host: LifecycleHost) {
   window.removeEventListener("popstate", host.popStateHandler);
+  document.removeEventListener("visibilitychange", host.visibilityChangeHandler);
   stopNodesPolling(host as unknown as Parameters<typeof stopNodesPolling>[0]);
   stopLogsPolling(host as unknown as Parameters<typeof stopLogsPolling>[0]);
   stopDebugPolling(host as unknown as Parameters<typeof stopDebugPolling>[0]);
+  stopTasksPolling(host as unknown as Parameters<typeof stopTasksPolling>[0]);
   host.client?.stop();
   host.client = null;
   host.connected = false;

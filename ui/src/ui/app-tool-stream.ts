@@ -3,6 +3,16 @@ import { truncateText } from "./format.ts";
 const TOOL_STREAM_LIMIT = 50;
 const TOOL_STREAM_THROTTLE_MS = 80;
 const TOOL_OUTPUT_CHAR_LIMIT = 120_000;
+const TERMINAL_TOOL_PHASES = new Set([
+  "result",
+  "error",
+  "failed",
+  "end",
+  "abort",
+  "aborted",
+  "cancel",
+  "cancelled",
+]);
 
 export type AgentEventPayload = {
   runId: string;
@@ -32,6 +42,7 @@ type ToolStreamHost = {
   toolStreamOrder: string[];
   chatToolMessages: Record<string, unknown>[];
   toolStreamSyncTimer: number | null;
+  browserTaskLive?: boolean;
 };
 
 function toTrimmedString(value: unknown): string | null {
@@ -40,6 +51,121 @@ function toTrimmedString(value: unknown): string | null {
   }
   const trimmed = value.trim();
   return trimmed ? trimmed : null;
+}
+
+function normalizeToolPhase(value: unknown): string {
+  return toTrimmedString(value)?.toLowerCase() ?? "";
+}
+
+function normalizeToolName(value: unknown): string | null {
+  return toTrimmedString(value)?.toLowerCase() ?? null;
+}
+
+function isBrowserToolName(value: unknown): boolean {
+  const name = normalizeToolName(value);
+  if (!name) {
+    return false;
+  }
+  return name === "browser" || name.startsWith("browser.") || name.startsWith("browser_");
+}
+
+function resolveBrowserAction(args: unknown): string | null {
+  if (!args || typeof args !== "object") {
+    return null;
+  }
+  const action = toTrimmedString((args as Record<string, unknown>).action);
+  return action?.toLowerCase() ?? null;
+}
+
+function isBrowserStopAction(toolName: string, action: string | null): boolean {
+  if (action === "stop") {
+    return true;
+  }
+  const normalized = normalizeToolName(toolName);
+  if (!normalized) {
+    return false;
+  }
+  return (
+    normalized === "browser.stop" || normalized.endsWith(".stop") || normalized.endsWith("_stop")
+  );
+}
+
+function resolveBrowserRunningFromResult(result: unknown): boolean | null {
+  if (!result || typeof result !== "object") {
+    return null;
+  }
+  const record = result as Record<string, unknown>;
+  if (typeof record.running === "boolean") {
+    return record.running;
+  }
+  const details = record.details;
+  if (
+    details &&
+    typeof details === "object" &&
+    typeof (details as Record<string, unknown>).running === "boolean"
+  ) {
+    return (details as Record<string, unknown>).running as boolean;
+  }
+  return null;
+}
+
+function syncBrowserTaskLiveFlag(host: ToolStreamHost) {
+  if (host.browserTaskLive !== true) {
+    host.browserTaskLive = true;
+  }
+}
+
+function clearBrowserTaskLiveFlag(host: ToolStreamHost) {
+  if (host.browserTaskLive !== false) {
+    host.browserTaskLive = false;
+  }
+}
+
+function trackBrowserToolActivity(
+  host: ToolStreamHost,
+  params: {
+    toolName: string;
+    phase: string;
+    args: unknown;
+    result: unknown;
+    isError: boolean;
+  },
+) {
+  if (!isBrowserToolName(params.toolName)) {
+    return;
+  }
+
+  const action = resolveBrowserAction(params.args);
+  const stopAction = isBrowserStopAction(params.toolName, action);
+  const terminal = TERMINAL_TOOL_PHASES.has(params.phase);
+
+  if (!terminal) {
+    // Any non-stop browser action implies the browser session is active.
+    if (!stopAction) {
+      syncBrowserTaskLiveFlag(host);
+    }
+    return;
+  }
+
+  // Prefer explicit running state if the tool returned it.
+  const running = resolveBrowserRunningFromResult(params.result);
+  if (running === true) {
+    syncBrowserTaskLiveFlag(host);
+    return;
+  }
+  if (running === false) {
+    clearBrowserTaskLiveFlag(host);
+    return;
+  }
+
+  // Fallback when result payload has no explicit running flag.
+  if (stopAction && params.phase === "result" && !params.isError) {
+    clearBrowserTaskLiveFlag(host);
+    return;
+  }
+  if (!stopAction) {
+    syncBrowserTaskLiveFlag(host);
+  }
 }
 
 function resolveModelLabel(provider: unknown, model: unknown): string | null {
@@ -234,6 +360,7 @@ export function resetToolStream(host: ToolStreamHost) {
   host.toolStreamById.clear();
   host.toolStreamOrder = [];
   host.chatToolMessages = [];
+  host.browserTaskLive = false;
   flushToolStreamSync(host);
 }
 
@@ -413,7 +540,7 @@ export function handleAgentEvent(host: ToolStreamHost, payload?: AgentEventPaylo
     return;
   }
   const name = typeof data.name === "string" ? data.name : "tool";
-  const phase = typeof data.phase === "string" ? data.phase : "";
+  const phase = normalizeToolPhase(data.phase);
   const args = phase === "start" ? data.args : undefined;
   const output =
     phase === "update"
@@ -448,6 +575,14 @@ export function handleAgentEvent(host: ToolStreamHost, payload?: AgentEventPaylo
     }
     entry.updatedAt = now;
   }
+
+  trackBrowserToolActivity(host, {
+    toolName: name,
+    phase,
+    args: args ?? entry.args,
+    result: data.result,
+    isError: Boolean(data.isError),
+  });
 
   entry.message = buildToolStreamMessage(entry);
   trimToolStream(host);

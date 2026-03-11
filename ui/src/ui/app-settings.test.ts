@@ -5,6 +5,7 @@ import type { Tab } from "./navigation.ts";
 type SettingsHost = Parameters<typeof setTabFromRoute>[0] & {
   logsPollInterval: number | null;
   debugPollInterval: number | null;
+  tasksPollInterval: number | null;
 };
 
 const createHost = (tab: Tab): SettingsHost => ({
@@ -35,6 +36,7 @@ const createHost = (tab: Tab): SettingsHost => ({
   themeMediaHandler: null,
   logsPollInterval: null,
   debugPollInterval: null,
+  tasksPollInterval: null,
 });
 
 describe("setTabFromRoute", () => {
@@ -66,5 +68,15 @@ describe("setTabFromRoute", () => {
 
     setTabFromRoute(host, "chat");
     expect(host.debugPollInterval).toBeNull();
+  });
+
+  it("starts and stops tasks polling based on the tab", () => {
+    const host = createHost("chat");
+
+    setTabFromRoute(host, "tasks");
+    expect(host.tasksPollInterval).not.toBeNull();
+
+    setTabFromRoute(host, "chat");
+    expect(host.tasksPollInterval).toBeNull();
   });
 });
