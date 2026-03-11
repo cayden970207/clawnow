@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { requireAuth, supabaseAdmin } from "@/lib/server-auth";
 import { ClawNowService, ClawNowServiceError } from "@/lib/services/clawnow.service";
 import type { ClawNowRequestMeta } from "@/lib/services/clawnow.service";
 
@@ -9,6 +10,56 @@ export function createClawNowService() {
     clawNowServiceSingleton = new ClawNowService();
   }
   return clawNowServiceSingleton;
+}
+
+type OrgAccessDenied = { authorized: false; response: NextResponse };
+type OrgAccessGranted = { authorized: true; userId: string };
+type OrgAccessContext = OrgAccessDenied | OrgAccessGranted;
+
+export async function requireClawNowOrgAccess(request: NextRequest): Promise<OrgAccessContext> {
+  const auth = await requireAuth(request);
+  if (!auth.authorized) {
+    return auth;
+  }
+
+  const { count, error } = await supabaseAdmin
+    .from("organization_members")
+    .select("organization_id", { count: "exact", head: true })
+    .eq("user_id", auth.userId)
+    .limit(1);
+
+  if (error) {
+    return {
+      authorized: false,
+      response: NextResponse.json(
+        {
+          success: false,
+          error: "Failed to verify organization access. Please try again.",
+          errorCode: "ORG_MEMBERSHIP_CHECK_FAILED",
+        },
+        { status: 503 },
+      ),
+    };
+  }
+
+  if (!count || count < 1) {
+    return {
+      authorized: false,
+      response: NextResponse.json(
+        {
+          success: false,
+          error: "ClawNow is currently available to organization members only.",
+          errorCode: "ORG_MEMBERSHIP_REQUIRED",
+        },
+        { status: 403 },
+      ),
+    };
+  }
+
+  return {
+    authorized: true,
+    userId: auth.userId,
+  };
 }
 
 export function toRequestMeta(request: NextRequest): ClawNowRequestMeta {

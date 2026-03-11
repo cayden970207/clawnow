@@ -1,5 +1,8 @@
 {
-  "version": "2026.2.26-clawnow-brand1",
-  "url": "https://claw-now.app/bootstrap/control-ui-2026.2.26-clawnow-brand1.tar.gz",
-  "sha256": "24523724526979f9f4594553129c4578e496ca97ee5a2d5b7a0d9d5549c484b5"
+  "version": "2026.3.5-tasks4",
+  "url": "https://claw-now.app/bootstrap/control-ui-2026.3.5-tasks4.tar.gz",
+  "sha256": "4415c2a0cf154430c678991d9827cbc1a3959c4d37c503c996704725a28b443a",
+  "backendVersion": "2026.2.23-tasks1",
+  "backendPackageUrl": "https://claw-now.app/bootstrap/openclaw-2026.2.23-tasks1.tar.gz",
+  "backendPackageSha256": "23fc8bf33affc844fd77a84a3ad8e13af83e0d2a3947f4cebb3090c5c0f221d3"
 }

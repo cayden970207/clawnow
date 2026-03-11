@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import { requireAuth } from "@/lib/server-auth";
 import {
   clawNowErrorResponse,
   createClawNowService,
+  requireClawNowOrgAccess,
   toRequestMeta,
 } from "@/lib/services/clawnow-http";
 
@@ -49,7 +49,7 @@ function parseRequestBody(body: OnboardingNextBody): {
 }
 
 export async function POST(request: NextRequest) {
-  const auth = await requireAuth(request);
+  const auth = await requireClawNowOrgAccess(request);
   if (!auth.authorized) {
     return auth.response;
   }

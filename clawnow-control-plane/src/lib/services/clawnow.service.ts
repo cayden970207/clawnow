@@ -15,6 +15,10 @@ import {
   HetznerApiError,
   type HetznerServer,
 } from "@/lib/services/clawnow-hetzner.service";
+import {
+  buildClawNowGatewayDefaultsPatch,
+  OPENAI_MEMORY_EMBED_MODEL,
+} from "./clawnow-gateway-defaults";
 
 export type ClawInstanceStatus =
   | "provisioning"
@@ -199,6 +203,7 @@ const GATEWAY_CONFIG_PATCH_MAX_ATTEMPTS = 3;
 const GATEWAY_CONFIG_PATCH_RETRY_DELAY_MS = 400;
 const GATEWAY_HEALTH_PATH = "__clawnow/health";
 const GATEWAY_REPAIR_PATH = "__clawnow/repair/gateway";
+const CONTROL_UI_REPAIR_PATH = "__clawnow/repair/control-ui";
 // First boot can be slow (apt + Node + OpenClaw + desktop/browser deps). Avoid
 // marking the VM as errored too early; defer hard failure to provisioningTimeoutSeconds.
 const GATEWAY_UPSTREAM_BOOT_TIMEOUT_MS = 12 * 60 * 1000;
@@ -219,11 +224,9 @@ const OPENAI_CODEX_OAUTH_REDIRECT_URI = "http://localhost:1455/auth/callback";
 const OPENAI_CODEX_OAUTH_SCOPE = "openid profile email offline_access";
 const OPENAI_CODEX_OAUTH_ORIGINATOR = "pi";
 const OPENAI_CODEX_OAUTH_SESSION_TTL_MS = 30 * 60 * 1000;
-const OPENAI_MEMORY_EMBED_MODEL = "text-embedding-3-small";
 const CLAWNOW_DEFAULT_OPENCLAW_VERSION = "2026.2.23";
 const CLAWNOW_DEFAULT_CONTROL_SESSION_TTL_SECONDS = 2 * 60 * 60;
 const CLAWNOW_MIN_CONTROL_SESSION_TTL_SECONDS = 30 * 60;
-const CLAWNOW_DEFAULT_CHANNEL_IDS = ["telegram", "whatsapp"] as const;
 const DEFAULT_MAIN_SESSION_KEY = "main";
 const DEFAULT_BOOTSTRAP_SCRIPT_URL =
   "https://raw.githubusercontent.com/openclaw/openclaw/main/scripts/clawnow-vm-bootstrap.sh";
@@ -320,7 +323,7 @@ function getNumberEnv(name: string, defaultValue: number): number {
   return parsed;
 }
 
-function clampPort(value: number, fallback: number): number {
+function _clampPort(value: number, fallback: number): number {
   const normalized = Number.isFinite(value) ? Math.floor(value) : fallback;
   if (!Number.isFinite(normalized) || normalized <= 0 || normalized > 65535) {
     return fallback;
@@ -429,15 +432,6 @@ function asObjectRecord(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>;
 }
 
-function asTrimmedStringArray(value: unknown): string[] | null {
-  if (!Array.isArray(value)) {
-    return null;
-  }
-  return value
-    .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
-    .filter(Boolean);
-}
-
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
 }
@@ -486,7 +480,10 @@ function loadClawNowConfig(): ClawNowConfig {
   const controlSessionTtlSeconds = Math.max(
     CLAWNOW_MIN_CONTROL_SESSION_TTL_SECONDS,
     Math.floor(
-      getNumberEnv("CLAWNOW_CONTROL_SESSION_TTL_SECONDS", CLAWNOW_DEFAULT_CONTROL_SESSION_TTL_SECONDS),
+      getNumberEnv(
+        "CLAWNOW_CONTROL_SESSION_TTL_SECONDS",
+        CLAWNOW_DEFAULT_CONTROL_SESSION_TTL_SECONDS,
+      ),
     ),
   );
 
@@ -699,11 +696,12 @@ export class ClawNowService {
             hasActiveSubscription: latestBalancePerOrg.has(organizationId),
           } satisfies ClawWorkspaceBillingOrganization;
         })
-        .sort((left, right) => left.name.localeCompare(right.name));
+        .toSorted((left, right) => left.name.localeCompare(right.name));
 
       const selectedOrganization =
         requestedOrganizationId && organizationProfiles.has(requestedOrganizationId)
-          ? organizations.find((organization) => organization.id === requestedOrganizationId) || null
+          ? organizations.find((organization) => organization.id === requestedOrganizationId) ||
+            null
           : organizations.length === 1
             ? organizations[0]
             : null;
@@ -1004,8 +1002,9 @@ export class ClawNowService {
             if (!everReady) {
               const provisioningElapsedMs =
                 Date.now() - new Date(current.provisioning_started_at).getTime();
-              const probeTimedOut =
-                (gatewayProbe.reason || "").toLowerCase().includes("probe timed out");
+              const probeTimedOut = (gatewayProbe.reason || "")
+                .toLowerCase()
+                .includes("probe timed out");
               // Some environments can intermittently fail control-plane -> VM probes even while
               // the VM is healthy for end users. After a short grace window, allow launch and
               // let the browser perform the final direct connectivity check.
@@ -1366,6 +1365,103 @@ export class ClawNowService {
     return { instance, changed };
   }
 
+  async restartGateway(
+    userId: string,
+    requestMeta?: ClawNowRequestMeta,
+  ): Promise<{ instance: ClawInstance; restarted: boolean }> {
+    const instance = await this.requireRunningInstance(userId);
+    const session = await this.createControlGatewaySession(instance, userId, requestMeta, {
+      syncControlUiOrigins: true,
+      strictControlUiOriginSync: false,
+    });
+    let managedUpdaterAttempted = false;
+    let managedUpdaterApplied = false;
+    if (this.config.controlUiManifestUrl) {
+      managedUpdaterAttempted = true;
+      const scriptUrls = this.resolveBootstrapScriptUrls();
+      try {
+        const updaterResult = await this.updateControlUiViaProxy({
+          gatewayWebSocketUrl: session.gatewayWebSocketUrl,
+          token: session.token,
+          manifestUrl: this.config.controlUiManifestUrl,
+          updaterScriptUrl: scriptUrls.controlUiUpdaterScriptUrl,
+        });
+        managedUpdaterApplied = updaterResult.updated;
+      } catch {
+        managedUpdaterApplied = false;
+      }
+    }
+    const restarted = await this.repairGatewayViaProxy({
+      gatewayWebSocketUrl: session.gatewayWebSocketUrl,
+      token: session.token,
+      reason: "manual-gateway-restart",
+    });
+
+    await this.logEvent(
+      instance.id,
+      userId,
+      restarted ? "gateway.restart" : "gateway.restart.degraded",
+      restarted
+        ? "Gateway restart requested from workspace"
+        : "Gateway restart requested from workspace, but upstream did not report ready",
+      {
+        restarted,
+        managedUpdaterAttempted,
+        managedUpdaterApplied,
+        ip: requestMeta?.ip || null,
+      },
+      restarted ? "info" : "warn",
+    );
+
+    return { instance, restarted };
+  }
+
+  async updateControlUi(
+    userId: string,
+    requestMeta?: ClawNowRequestMeta,
+  ): Promise<{ instance: ClawInstance; updated: boolean; message: string }> {
+    const instance = await this.requireRunningInstance(userId);
+    const session = await this.createControlGatewaySession(instance, userId, requestMeta, {
+      syncControlUiOrigins: true,
+      strictControlUiOriginSync: false,
+    });
+
+    if (!this.config.controlUiManifestUrl) {
+      throw new ClawNowServiceError(
+        "CONTROL_UI_MANIFEST_MISSING",
+        "Control UI manifest URL is not configured on this deployment.",
+        503,
+      );
+    }
+
+    const scriptUrls = this.resolveBootstrapScriptUrls();
+    const result = await this.updateControlUiViaProxy({
+      gatewayWebSocketUrl: session.gatewayWebSocketUrl,
+      token: session.token,
+      manifestUrl: this.config.controlUiManifestUrl,
+      updaterScriptUrl: scriptUrls.controlUiUpdaterScriptUrl,
+    });
+    const message = result.updated
+      ? "Workspace UI updated on this VM. Refresh Gateway to load the latest interface."
+      : "Workspace UI is already on the latest version for this VM.";
+
+    await this.logEvent(
+      instance.id,
+      userId,
+      "control_ui.update",
+      result.updated
+        ? "Updated workspace Control UI package on VM"
+        : "Control UI package already up to date",
+      {
+        updated: result.updated,
+        currentRoot: result.currentRoot,
+        ip: requestMeta?.ip || null,
+      },
+    );
+
+    return { instance, updated: result.updated, message };
+  }
+
   private async applyClawNowGatewayDefaults(params: {
     gatewayWebSocketUrl: string;
     token: string;
@@ -1377,216 +1473,12 @@ export class ClawNowService {
       "config.get",
       {},
     );
-    const patch = this.buildClawNowGatewayDefaultsPatch(snapshot?.config, params.force);
+    const patch = buildClawNowGatewayDefaultsPatch(snapshot?.config, params.force);
     if (!patch) {
       return false;
     }
     await this.patchGatewayConfig(params.gatewayWebSocketUrl, params.token, patch);
     return true;
-  }
-
-  private buildClawNowGatewayDefaultsPatch(
-    configRaw: unknown,
-    force: boolean,
-  ): Record<string, unknown> | null {
-    const config = asObjectRecord(configRaw) ?? {};
-    const gateway = asObjectRecord(config.gateway);
-    const controlUi = asObjectRecord(gateway?.controlUi);
-    const browser = asObjectRecord(config.browser);
-    const web = asObjectRecord(config.web);
-    const tools = asObjectRecord(config.tools);
-    const exec = asObjectRecord(tools?.exec);
-    const channels = asObjectRecord(config.channels);
-    const plugins = asObjectRecord(config.plugins);
-    const pluginEntries = asObjectRecord(plugins?.entries);
-
-    const patch: Record<string, unknown> = {};
-
-    const gatewayPatch: Record<string, unknown> = {};
-    const controlUiPatch: Record<string, unknown> = {};
-    const hostHeaderFallback = controlUi?.dangerouslyAllowHostHeaderOriginFallback;
-    if (
-      (force && hostHeaderFallback !== true) ||
-      (!force && hostHeaderFallback === undefined)
-    ) {
-      controlUiPatch.dangerouslyAllowHostHeaderOriginFallback = true;
-    }
-    const disableDeviceAuth = controlUi?.dangerouslyDisableDeviceAuth;
-    if ((force && disableDeviceAuth !== true) || (!force && disableDeviceAuth === undefined)) {
-      controlUiPatch.dangerouslyDisableDeviceAuth = true;
-    }
-    if (Object.keys(controlUiPatch).length > 0) {
-      gatewayPatch.controlUi = controlUiPatch;
-    }
-    if (Object.keys(gatewayPatch).length > 0) {
-      patch.gateway = gatewayPatch;
-    }
-
-    const browserPatch: Record<string, unknown> = {};
-    const browserEnabled = browser?.enabled;
-    if ((force && browserEnabled !== true) || (!force && browserEnabled === undefined)) {
-      browserPatch.enabled = true;
-    }
-    const browserNoSandbox = browser?.noSandbox;
-    if ((force && browserNoSandbox !== true) || (!force && browserNoSandbox === undefined)) {
-      // ClawNow gateway runs as root in VM bootstrap, so Chrome must use --no-sandbox.
-      browserPatch.noSandbox = true;
-    }
-    // Keep defaults patch compatible with OpenClaw 2026.2.23 schema.
-    // Avoid patching browser.extraArgs (unsupported in that pinned version).
-    const browserDefaultProfile =
-      typeof browser?.defaultProfile === "string" ? browser.defaultProfile.trim() : "";
-    const shouldPatchDefaultProfile = force
-      ? browserDefaultProfile !== "openclaw"
-      : !browserDefaultProfile || browserDefaultProfile === "chrome";
-    if (shouldPatchDefaultProfile) {
-      // ClawNow defaults to VM-side managed browser so Desktop Live can mirror actions.
-      // Keep user-custom profiles untouched.
-      browserPatch.defaultProfile = "openclaw";
-    }
-    if (Object.keys(browserPatch).length > 0) {
-      patch.browser = browserPatch;
-    }
-
-    const webEnabled = web?.enabled;
-    if ((force && webEnabled !== true) || (!force && webEnabled === undefined)) {
-      patch.web = { enabled: true };
-    }
-
-    const execPatch: Record<string, unknown> = {};
-    const execSecurity = typeof exec?.security === "string" ? exec.security.trim().toLowerCase() : "";
-    const shouldPatchExecSecurity = force
-      ? execSecurity !== "allowlist"
-      : !execSecurity || execSecurity === "full";
-    if (shouldPatchExecSecurity) {
-      // Keep managed VM shells least-privileged by default.
-      execPatch.security = "allowlist";
-    }
-    const execAsk = typeof exec?.ask === "string" ? exec.ask.trim().toLowerCase() : "";
-    const validExecAsk = execAsk === "off" || execAsk === "on-miss" || execAsk === "always";
-    const shouldPatchExecAsk = force ? execAsk !== "on-miss" : !validExecAsk;
-    if (shouldPatchExecAsk) {
-      execPatch.ask = "on-miss";
-    }
-    if (Object.keys(execPatch).length > 0) {
-      patch.tools = {
-        exec: execPatch,
-      };
-    }
-
-    const channelsPatch: Record<string, unknown> = {};
-    const pluginEntriesPatch: Record<string, unknown> = {};
-    for (const channelId of CLAWNOW_DEFAULT_CHANNEL_IDS) {
-      const channelConfig = asObjectRecord(channels?.[channelId]);
-      const channelEnabled = channelConfig?.enabled;
-      if ((force && channelEnabled !== true) || (!force && channelEnabled === undefined)) {
-        channelsPatch[channelId] = { enabled: true };
-      }
-
-      const pluginEntry = asObjectRecord(pluginEntries?.[channelId]);
-      const pluginEnabled = pluginEntry?.enabled;
-      if ((force && pluginEnabled !== true) || (!force && pluginEnabled === undefined)) {
-        pluginEntriesPatch[channelId] = { enabled: true };
-      }
-    }
-    if (Object.keys(channelsPatch).length > 0) {
-      patch.channels = channelsPatch;
-    }
-
-    const pluginsPatch: Record<string, unknown> = {};
-    if (Object.keys(pluginEntriesPatch).length > 0) {
-      pluginsPatch.entries = pluginEntriesPatch;
-    }
-
-    const allow = asTrimmedStringArray(plugins?.allow);
-    if (allow && allow.length > 0) {
-      const missingAllow = CLAWNOW_DEFAULT_CHANNEL_IDS.filter((id) => !allow.includes(id));
-      if (missingAllow.length > 0) {
-        pluginsPatch.allow = [...allow, ...missingAllow];
-      }
-    }
-
-    if (force) {
-      const deny = asTrimmedStringArray(plugins?.deny);
-      if (deny) {
-        const managedChannelSet = new Set<string>(CLAWNOW_DEFAULT_CHANNEL_IDS);
-        const nextDeny = deny.filter((entry) => !managedChannelSet.has(entry));
-        if (nextDeny.length !== deny.length) {
-          pluginsPatch.deny = nextDeny;
-        }
-      }
-    }
-
-    if (Object.keys(pluginsPatch).length > 0) {
-      patch.plugins = pluginsPatch;
-    }
-
-    const agents = asObjectRecord(config.agents);
-    const agentDefaults = asObjectRecord(agents?.defaults);
-    const memorySearch = asObjectRecord(agentDefaults?.memorySearch);
-    const memorySearchRemote = asObjectRecord(memorySearch?.remote);
-    const memorySearchBatch = asObjectRecord(memorySearchRemote?.batch);
-    const models = asObjectRecord(config.models);
-    const providers = asObjectRecord(models?.providers);
-    const openAiProvider = asObjectRecord(providers?.openai);
-
-    const memorySearchPatch: Record<string, unknown> = {};
-    const memoryRemotePatch: Record<string, unknown> = {};
-    if (memorySearch?.enabled === undefined) {
-      memorySearchPatch.enabled = true;
-    }
-    const memoryProvider =
-      typeof memorySearch?.provider === "string" ? memorySearch.provider.trim() : "";
-    if (!memoryProvider) {
-      memorySearchPatch.provider = "openai";
-    }
-    const memoryModel = typeof memorySearch?.model === "string" ? memorySearch.model.trim() : "";
-    if (!memoryModel) {
-      memorySearchPatch.model = OPENAI_MEMORY_EMBED_MODEL;
-    }
-    const memoryFallback =
-      typeof memorySearch?.fallback === "string" ? memorySearch.fallback.trim() : "";
-    if (!memoryFallback) {
-      memorySearchPatch.fallback = "openai";
-    }
-    const memoryRemoteApiKey =
-      typeof memorySearchRemote?.apiKey === "string" ? memorySearchRemote.apiKey.trim() : "";
-    const openAiApiKey =
-      typeof openAiProvider?.apiKey === "string" ? openAiProvider.apiKey.trim() : "";
-    if (!memoryRemoteApiKey && openAiApiKey) {
-      memoryRemotePatch.apiKey = openAiApiKey;
-    }
-
-    const memoryBatchPatch: Record<string, unknown> = {};
-    if (memorySearchBatch?.enabled === undefined) {
-      memoryBatchPatch.enabled = true;
-    }
-    if (memorySearchBatch?.wait === undefined) {
-      memoryBatchPatch.wait = true;
-    }
-    const batchConcurrency =
-      typeof memorySearchBatch?.concurrency === "number" && Number.isFinite(memorySearchBatch.concurrency)
-        ? Math.max(1, Math.floor(memorySearchBatch.concurrency))
-        : null;
-    if (batchConcurrency === null) {
-      memoryBatchPatch.concurrency = 2;
-    }
-    if (Object.keys(memoryBatchPatch).length > 0) {
-      memoryRemotePatch.batch = memoryBatchPatch;
-    }
-    if (Object.keys(memoryRemotePatch).length > 0) {
-      memorySearchPatch.remote = memoryRemotePatch;
-    }
-
-    if (Object.keys(memorySearchPatch).length > 0) {
-      patch.agents = {
-        defaults: {
-          memorySearch: memorySearchPatch,
-        },
-      };
-    }
-
-    return Object.keys(patch).length > 0 ? patch : null;
   }
 
   private async patchOpenAiProviderAndWorkspaceDefaults(params: {
@@ -1637,14 +1529,15 @@ export class ClawNowService {
       providerPatch.models = [];
     }
 
-    const defaultsPatch = this.buildClawNowGatewayDefaultsPatch(snapshot?.config, false);
+    const defaultsPatch = buildClawNowGatewayDefaultsPatch(snapshot?.config, false);
     const defaultsAgentDefaults = asObjectRecord(asObjectRecord(defaultsPatch?.agents)?.defaults);
     const defaultsMemorySearch = asObjectRecord(defaultsAgentDefaults?.memorySearch);
     const defaultsMemoryRemote = asObjectRecord(defaultsMemorySearch?.remote);
     const defaultsMemoryBatch = asObjectRecord(defaultsMemoryRemote?.batch);
 
-    let mergedMemorySearch: Record<string, unknown> | undefined =
-      defaultsMemorySearch ? { ...defaultsMemorySearch } : undefined;
+    let mergedMemorySearch: Record<string, unknown> | undefined = defaultsMemorySearch
+      ? { ...defaultsMemorySearch }
+      : undefined;
     if (params.providerId === "openai") {
       const existingBatchConcurrency =
         typeof defaultsMemoryBatch?.concurrency === "number" &&
@@ -1652,22 +1545,21 @@ export class ClawNowService {
           ? Math.max(1, Math.floor(defaultsMemoryBatch.concurrency))
           : 2;
       mergedMemorySearch = {
-        ...(mergedMemorySearch || {}),
+        ...mergedMemorySearch,
         enabled: true,
         provider: "openai",
         model: OPENAI_MEMORY_EMBED_MODEL,
         fallback: "openai",
         remote: {
-          ...(defaultsMemoryRemote || {}),
+          ...defaultsMemoryRemote,
           apiKey: params.apiKey,
           batch: {
-            ...(defaultsMemoryBatch || {}),
+            ...defaultsMemoryBatch,
             enabled:
               typeof defaultsMemoryBatch?.enabled === "boolean"
                 ? defaultsMemoryBatch.enabled
                 : true,
-            wait:
-              typeof defaultsMemoryBatch?.wait === "boolean" ? defaultsMemoryBatch.wait : true,
+            wait: typeof defaultsMemoryBatch?.wait === "boolean" ? defaultsMemoryBatch.wait : true,
             concurrency: existingBatchConcurrency,
           },
         },
@@ -1675,7 +1567,7 @@ export class ClawNowService {
     }
 
     const mergedAgentDefaults: Record<string, unknown> = {
-      ...(defaultsAgentDefaults || {}),
+      ...defaultsAgentDefaults,
       model: {
         primary: modelRef,
       },
@@ -1690,7 +1582,7 @@ export class ClawNowService {
     }
 
     const mergedPatch: Record<string, unknown> = {
-      ...(defaultsPatch || {}),
+      ...defaultsPatch,
       models: {
         providers: {
           [params.providerId]: providerPatch,
@@ -1715,15 +1607,10 @@ export class ClawNowService {
     }
 
     try {
-      await this.requestGatewayMethod(
-        params.gatewayWebSocketUrl,
-        params.token,
-        "sessions.patch",
-        {
-          key: DEFAULT_MAIN_SESSION_KEY,
-          model: modelRef,
-        },
-      );
+      await this.requestGatewayMethod(params.gatewayWebSocketUrl, params.token, "sessions.patch", {
+        key: DEFAULT_MAIN_SESSION_KEY,
+        model: modelRef,
+      });
     } catch {
       // Best-effort: keep auth setup successful even if main session wasn't created yet.
     }
@@ -1852,7 +1739,8 @@ export class ClawNowService {
     const payloadRecord = asObjectRecord(payload);
     if (!response.ok) {
       const oauthError =
-        typeof payloadRecord?.error_description === "string" && payloadRecord.error_description.trim()
+        typeof payloadRecord?.error_description === "string" &&
+        payloadRecord.error_description.trim()
           ? payloadRecord.error_description.trim()
           : typeof payloadRecord?.error === "string" && payloadRecord.error.trim()
             ? payloadRecord.error.trim()
@@ -2871,7 +2759,10 @@ export class ClawNowService {
     if (message.includes("upstream_unavailable") || message.includes("healthhttp=503")) {
       return "gateway_upstream_unavailable";
     }
-    if (message.includes("probe timed out") || message.includes("gateway websocket failed to open")) {
+    if (
+      message.includes("probe timed out") ||
+      message.includes("gateway websocket failed to open")
+    ) {
       return "gateway_probe_timeout";
     }
     if (message.includes("upstream websocket connection failed")) {
@@ -2947,12 +2838,120 @@ export class ClawNowService {
         return upstreamReady;
       }
 
-      return payload.success === false ? false : true;
+      return payload.success !== false;
     } catch (error) {
       if (isAbortError(error)) {
         return false;
       }
       return false;
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
+  }
+
+  private async updateControlUiViaProxy(params: {
+    gatewayWebSocketUrl: string;
+    token: string;
+    manifestUrl: string;
+    updaterScriptUrl: string;
+  }): Promise<{ updated: boolean; currentRoot: string | null }> {
+    const origin = this.toHttpOriginFromWebSocketUrl(params.gatewayWebSocketUrl);
+    if (!origin) {
+      throw new ClawNowServiceError(
+        "CONTROL_UI_UPDATE_FAILED",
+        "Could not derive gateway origin from websocket URL.",
+        502,
+      );
+    }
+
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(() => controller.abort(), 40_000);
+    try {
+      const url = new URL(`/${CONTROL_UI_REPAIR_PATH}`, origin).toString();
+      const response = await fetch(url, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          authorization: `Bearer ${params.token}`,
+          "content-type": "application/json; charset=utf-8",
+          "user-agent": "clawnow-control-plane/control-ui-update",
+        },
+        body: JSON.stringify({
+          manifestUrl: params.manifestUrl,
+          updaterScriptUrl: params.updaterScriptUrl,
+        }),
+      });
+
+      let payload: {
+        success?: unknown;
+        error?: unknown;
+        code?: unknown;
+        details?: {
+          updated?: unknown;
+          currentRoot?: unknown;
+        };
+      } = {};
+      try {
+        payload = (await response.json()) as {
+          success?: unknown;
+          error?: unknown;
+          code?: unknown;
+          details?: {
+            updated?: unknown;
+            currentRoot?: unknown;
+          };
+        };
+      } catch {
+        payload = {};
+      }
+
+      if (!response.ok || payload.success === false) {
+        const rawCode =
+          typeof payload.code === "string" && payload.code.trim()
+            ? payload.code.trim().toLowerCase()
+            : "";
+        if (response.status === 404 || rawCode === "route_not_found") {
+          throw new ClawNowServiceError(
+            "CONTROL_UI_UPDATE_UNSUPPORTED",
+            "This VM image does not support one-click UI update yet. Please redeploy the VM once, then retry.",
+            409,
+          );
+        }
+        const message =
+          typeof payload.error === "string" && payload.error.trim()
+            ? payload.error.trim()
+            : `Control UI update failed with HTTP ${response.status}`;
+        throw new ClawNowServiceError("CONTROL_UI_UPDATE_FAILED", message, response.status || 502);
+      }
+
+      const updatedRaw =
+        payload.details && typeof payload.details === "object"
+          ? payload.details.updated
+          : undefined;
+      const currentRootRaw =
+        payload.details && typeof payload.details === "object"
+          ? payload.details.currentRoot
+          : undefined;
+      return {
+        updated: updatedRaw === true,
+        currentRoot: typeof currentRootRaw === "string" ? currentRootRaw : null,
+      };
+    } catch (error) {
+      if (isAbortError(error)) {
+        throw new ClawNowServiceError(
+          "CONTROL_UI_UPDATE_TIMEOUT",
+          "Control UI update request timed out while waiting for VM response.",
+          504,
+        );
+      }
+      if (error instanceof ClawNowServiceError) {
+        throw error;
+      }
+      throw new ClawNowServiceError(
+        "CONTROL_UI_UPDATE_FAILED",
+        error instanceof Error ? error.message : "Control UI update failed",
+        502,
+      );
     } finally {
       clearTimeout(timeoutHandle);
     }

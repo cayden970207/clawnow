@@ -1147,6 +1147,10 @@ CLAWNOW_PROXY_NOVNC_PREFIX=${NOVNC_PREFIX}
 CLAWNOW_PROXY_EXPECTED_ISS=clawnow-control-plane
 CLAWNOW_PROXY_EXPECTED_AUD=openclaw-gateway
 CLAWNOW_PROXY_HEALTH_UPSTREAM_TIMEOUT_MS=2000
+CLAWNOW_CONTROL_UI_MANIFEST_URL=${CONTROL_UI_MANIFEST_URL}
+CLAWNOW_CONTROL_UI_UPDATER_SCRIPT_URL=${CONTROL_UI_UPDATER_SCRIPT_URL}
+CLAWNOW_CONTROL_UI_UPDATER_SCRIPT_PATH=/opt/clawnow/clawnow-control-ui-updater.sh
+CLAWNOW_CONTROL_UI_INSTALL_ROOT=/opt/clawnow/control-ui
 EOF_ENV
 
 if [[ "$ENABLE_HTTPS" == "1" && -z "$PUBLIC_HOST" ]]; then
@@ -1270,6 +1274,15 @@ config.gateway.auth.trustedProxy.requiredHeaders = [
 config.gateway.trustedProxies = ['127.0.0.2', '::1'];
 config.gateway.controlUi = config.gateway.controlUi || {};
 config.gateway.controlUi.basePath = process.env.CONTROL_PREFIX || '/clawnow';
+config.gateway.controlUi.features =
+  config.gateway.controlUi.features &&
+  typeof config.gateway.controlUi.features === 'object' &&
+  !Array.isArray(config.gateway.controlUi.features)
+    ? config.gateway.controlUi.features
+    : {};
+if (config.gateway.controlUi.features.tasks === undefined) {
+  config.gateway.controlUi.features.tasks = true;
+}
 config.update =
   config.update && typeof config.update === 'object' && !Array.isArray(config.update)
     ? config.update

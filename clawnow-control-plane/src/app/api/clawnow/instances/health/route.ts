@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { requireAuth } from "@/lib/server-auth";
-import { clawNowErrorResponse, createClawNowService } from "@/lib/services/clawnow-http";
+import {
+  clawNowErrorResponse,
+  createClawNowService,
+  requireClawNowOrgAccess,
+} from "@/lib/services/clawnow-http";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -14,7 +17,7 @@ function shouldSyncProvider(request: NextRequest): boolean {
 }
 
 export async function GET(request: NextRequest) {
-  const auth = await requireAuth(request);
+  const auth = await requireClawNowOrgAccess(request);
   if (!auth.authorized) {
     return auth.response;
   }

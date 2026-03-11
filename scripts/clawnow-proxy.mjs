@@ -129,9 +129,9 @@ function isLoopbackRemoteAddress(remoteAddress) {
 function hasForwardedHeaders(req) {
   return Boolean(
     req.headers["x-forwarded-for"] ||
-      req.headers["x-real-ip"] ||
-      req.headers["x-forwarded-host"] ||
-      req.headers["x-forwarded-proto"],
+    req.headers["x-real-ip"] ||
+    req.headers["x-forwarded-host"] ||
+    req.headers["x-forwarded-proto"],
   );
 }
 
@@ -541,7 +541,9 @@ function enforceGatewayTrustedProxyConfig(config) {
   // keeping public browser traffic on managed trusted-proxy auth.
   next.gateway.mode = "remote";
   next.gateway.remote =
-    next.gateway.remote && typeof next.gateway.remote === "object" && !Array.isArray(next.gateway.remote)
+    next.gateway.remote &&
+    typeof next.gateway.remote === "object" &&
+    !Array.isArray(next.gateway.remote)
       ? next.gateway.remote
       : {};
   next.gateway.remote.url = localGatewayUrl;
@@ -573,7 +575,9 @@ function enforceGatewayTrustedProxyConfig(config) {
   next.gateway.controlUi.basePath = next.gateway.controlUi.basePath || config.controlPrefix;
   next.gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback = true;
   next.update =
-    next.update && typeof next.update === "object" && !Array.isArray(next.update) ? next.update : {};
+    next.update && typeof next.update === "object" && !Array.isArray(next.update)
+      ? next.update
+      : {};
   // Platform-managed upgrades: keep VM-side update prompts/auto-updates disabled.
   next.update.checkOnStart = false;
   next.update.auto =
@@ -713,10 +717,7 @@ function buildTargetPath(route, requestUrl) {
   }
 
   const expectedSessionTypes = normalizeExpectedSessionTypes(route.expectedSessionType);
-  if (
-    expectedSessionTypes.length > 0 &&
-    !expectedSessionTypes.includes(route.claims.sessionType)
-  ) {
+  if (expectedSessionTypes.length > 0 && !expectedSessionTypes.includes(route.claims.sessionType)) {
     throw new Error("session_type_mismatch");
   }
 
@@ -735,7 +736,10 @@ function createProxyConfig() {
     bind: process.env.CLAWNOW_PROXY_BIND?.trim() || "127.0.0.1",
     port: parsePort(process.env.CLAWNOW_PROXY_PORT, 18790),
     sharedSecret,
-    tokenClockSkewSeconds: parsePositiveInt(process.env.CLAWNOW_PROXY_TOKEN_CLOCK_SKEW_SECONDS, 120),
+    tokenClockSkewSeconds: parsePositiveInt(
+      process.env.CLAWNOW_PROXY_TOKEN_CLOCK_SKEW_SECONDS,
+      120,
+    ),
     expectedIss: process.env.CLAWNOW_PROXY_EXPECTED_ISS?.trim() || "clawnow-control-plane",
     expectedAud: process.env.CLAWNOW_PROXY_EXPECTED_AUD?.trim() || "openclaw-gateway",
     instanceId: process.env.CLAWNOW_INSTANCE_ID?.trim() || "local",

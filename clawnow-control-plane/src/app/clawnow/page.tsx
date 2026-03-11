@@ -360,11 +360,14 @@ export default function ClawNowPage() {
   const [billing, setBilling] = useState<WorkspaceBillingSummary | null>(null);
   const [selectedOrganizationId, setSelectedOrganizationId] = useState<string>("all");
   const [error, setError] = useState<string | null>(null);
+  const [orgAccessRequired, setOrgAccessRequired] = useState(false);
 
   const [hasLoaded, setHasLoaded] = useState(false);
   const [provisioning, setProvisioning] = useState(false);
   const [recovering, setRecovering] = useState(false);
+  const [restartingGateway, setRestartingGateway] = useState(false);
   const [repairingGatewayDefaults, setRepairingGatewayDefaults] = useState(false);
+  const [updatingControlUi, setUpdatingControlUi] = useState(false);
   const [openingControlUi, setOpeningControlUi] = useState(false);
   const [refreshingHealth, setRefreshingHealth] = useState(false);
   const [loadingMessageIndex, setLoadingMessageIndex] = useState(0);
@@ -414,7 +417,15 @@ export default function ClawNowPage() {
       }>(response);
       setInstance(data.instance);
       setBilling(data.billing || null);
+      setOrgAccessRequired(false);
     } catch (err: unknown) {
+      if (err instanceof ApiError && err.code === "ORG_MEMBERSHIP_REQUIRED") {
+        setOrgAccessRequired(true);
+        setInstance(null);
+        setBilling(null);
+        setError(err.message);
+        return;
+      }
       const isTimeout = err instanceof DOMException && err.name === "AbortError";
       setError(
         isTimeout
@@ -462,9 +473,17 @@ export default function ClawNowPage() {
     setError(null);
     try {
       const headers = await getAuthHeaders();
+      const organizationId =
+        selectedOrganizationId && selectedOrganizationId !== "all" ? selectedOrganizationId : null;
       const response = await fetch("/api/clawnow/instances/provision", {
         method: "POST",
-        headers,
+        headers: {
+          ...headers,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          organizationId,
+        }),
       });
       const data = await parseApiResponse<{ instance: ClawInstance }>(response);
       setInstance(data.instance);
@@ -473,7 +492,7 @@ export default function ClawNowPage() {
     } finally {
       setProvisioning(false);
     }
-  }, [getAuthHeaders]);
+  }, [getAuthHeaders, selectedOrganizationId]);
 
   const handleRefreshHealth = useCallback(
     async (silent = false) => {
@@ -527,6 +546,31 @@ export default function ClawNowPage() {
     }
   }, [getAuthHeaders]);
 
+  const handleRestartGateway = useCallback(async () => {
+    setRestartingGateway(true);
+    setError(null);
+    setOnboardingMessage(null);
+    try {
+      const headers = await getAuthHeaders();
+      const response = await fetch("/api/clawnow/instances/restart-gateway", {
+        method: "POST",
+        headers,
+      });
+      const data = await parseApiResponse<{ instance: ClawInstance; restarted: boolean }>(response);
+      setInstance(data.instance);
+      setOnboardingMessage(
+        data.restarted
+          ? "Gateway restarted. If chat is reconnecting, wait a few seconds then try again."
+          : "Gateway restart requested. Upstream is still warming up; click Sync Health in a few seconds.",
+      );
+      void handleRefreshHealth(true);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Gateway restart failed");
+    } finally {
+      setRestartingGateway(false);
+    }
+  }, [getAuthHeaders, handleRefreshHealth]);
+
   const handleRepairGatewayDefaults = useCallback(async () => {
     setRepairingGatewayDefaults(true);
     setError(null);
@@ -548,6 +592,36 @@ export default function ClawNowPage() {
       setError(err instanceof Error ? err.message : "Failed to repair gateway defaults");
     } finally {
       setRepairingGatewayDefaults(false);
+    }
+  }, [getAuthHeaders]);
+
+  const handleUpdateControlUi = useCallback(async () => {
+    setUpdatingControlUi(true);
+    setError(null);
+    setOnboardingMessage(null);
+    try {
+      const headers = await getAuthHeaders();
+      const response = await fetch("/api/clawnow/instances/update-control-ui", {
+        method: "POST",
+        headers,
+      });
+      const data = await parseApiResponse<{
+        instance: ClawInstance;
+        updated: boolean;
+        message?: string;
+      }>(response);
+      setInstance(data.instance);
+      setOnboardingMessage(
+        typeof data.message === "string" && data.message.trim()
+          ? data.message
+          : data.updated
+            ? "Workspace UI updated for this VM."
+            : "Workspace UI is already up to date for this VM.",
+      );
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to sync workspace UI");
+    } finally {
+      setUpdatingControlUi(false);
     }
   }, [getAuthHeaders]);
 
@@ -847,7 +921,9 @@ export default function ClawNowPage() {
   useEffect(() => {
     if (user) {
       void loadCurrent();
+      return;
     }
+    setOrgAccessRequired(false);
   }, [user, loadCurrent]);
 
   useEffect(() => {
@@ -920,6 +996,10 @@ export default function ClawNowPage() {
   const showOAuthLoginShortcut = isRedirectUrlInputStep(onboardingStep);
   const isPreparingOrStarting = isWorkspaceLoading || workspaceStage === "booting";
   const loadingLine = CLAWNOW_LOADING_LINES[loadingMessageIndex];
+  const vmName = useMemo(() => {
+    const value = typeof instance?.server_name === "string" ? instance.server_name.trim() : "";
+    return value || "Unknown";
+  }, [instance?.server_name]);
   const organizationBalanceSummary = useMemo(() => {
     if (!billing) {
       return {
@@ -1039,7 +1119,7 @@ export default function ClawNowPage() {
             </p>
           </div>
 
-          {user && !isWorkspaceLoading && (
+          {user && !isWorkspaceLoading && !orgAccessRequired && (
             <div className="flex flex-wrap items-center gap-2">
               {billing?.status === "ok" && (billing.organizations || []).length > 1 && (
                 <select
@@ -1127,6 +1207,27 @@ export default function ClawNowPage() {
               Continue with Email
             </button>
           </section>
+        ) : orgAccessRequired ? (
+          <section className="mx-auto max-w-2xl rounded-3xl border border-[#EAEAEA] bg-white p-8 text-center shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+            <h2 className="text-2xl font-semibold tracking-tight text-[#111]">
+              Organization membership required
+            </h2>
+            <p className="mt-3 text-sm leading-relaxed text-[#666]">
+              ClawNow is temporarily available to organization members only. Join an organization
+              workspace first, then return to deploy your VM.
+            </p>
+            {error && (
+              <div className="mt-4 rounded-2xl border border-[#F1D1D1] bg-[#FFF6F6] px-4 py-3 text-sm text-[#9D1B1B]">
+                {error}
+              </div>
+            )}
+            <button
+              onClick={() => router.push("/")}
+              className="mt-6 inline-flex items-center gap-2 rounded-full bg-[#111] px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-[#2A2A2A]"
+            >
+              Back to Dashboard
+            </button>
+          </section>
         ) : workspaceStage === "deploy" ? (
           <section className="mx-auto max-w-3xl rounded-3xl border border-[#EAEAEA] bg-white p-8 shadow-[0_10px_35px_rgba(0,0,0,0.05)] md:p-12">
             <h1 className="text-4xl font-semibold tracking-tight text-[#111] md:text-5xl">
@@ -1171,11 +1272,16 @@ export default function ClawNowPage() {
                   Deploy VM -&gt; Setup Wizard -&gt; Launch Gateway.
                 </p>
               </div>
-              <span
-                className={`rounded-full border px-3 py-1 text-xs font-medium ${getStatusClass(instance?.status)}`}
-              >
-                {getStatusLabel(instance?.status)}
-              </span>
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                <span className="rounded-full border border-[#EAEAEA] bg-white px-3 py-1 text-xs font-medium text-[#555]">
+                  VM: <span className="font-semibold text-[#222]">{vmName}</span>
+                </span>
+                <span
+                  className={`rounded-full border px-3 py-1 text-xs font-medium ${getStatusClass(instance?.status)}`}
+                >
+                  {getStatusLabel(instance?.status)}
+                </span>
+              </div>
             </div>
 
             {bootingWarnings.map((warning, index) => (
@@ -1237,6 +1343,9 @@ export default function ClawNowPage() {
             <p className="mt-2 text-sm text-[#666]">
               Follow the prompts to connect your model and channels.
             </p>
+            <div className="mt-3 inline-flex items-center rounded-full border border-[#EAEAEA] bg-white px-3 py-1 text-xs font-medium text-[#555]">
+              VM: <span className="ml-1 font-semibold text-[#222]">{vmName}</span>
+            </div>
 
             {manualWizardMode && onboardingCompleted && (
               <div className="mt-4">
@@ -1424,6 +1533,23 @@ export default function ClawNowPage() {
               </div>
             )}
 
+            {canOpenSession && (
+              <div className="mt-4 flex flex-wrap gap-2">
+                <button
+                  onClick={handleRestartGateway}
+                  disabled={restartingGateway || onboardingBusy}
+                  className="inline-flex items-center justify-center gap-2 rounded-full border border-[#DCDCDC] bg-white px-4 py-2 text-xs font-semibold text-[#111] transition hover:bg-[#F6F6F6] disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {restartingGateway ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <RefreshCw className="h-3.5 w-3.5" />
+                  )}
+                  {restartingGateway ? "Restarting Gateway..." : "Restart Gateway"}
+                </button>
+              </div>
+            )}
+
             {onboardingStatus && (
               <p className="mt-3 text-xs uppercase tracking-[0.14em] text-[#7A7A7A]">
                 Status: {onboardingStatus}
@@ -1485,7 +1611,10 @@ export default function ClawNowPage() {
                     Your dedicated cloud workspace is ready when status turns Ready.
                   </p>
                 </div>
-                <div className="flex flex-wrap items-center gap-2">
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  <span className="rounded-full border border-[#EAEAEA] bg-white px-3 py-1 text-xs font-medium text-[#555]">
+                    VM: <span className="font-semibold text-[#222]">{vmName}</span>
+                  </span>
                   <span
                     className={`rounded-full border px-3 py-1 text-xs font-medium ${getStatusClass(instance?.status)}`}
                   >
@@ -1563,6 +1692,36 @@ export default function ClawNowPage() {
                         {repairingGatewayDefaults ? "Repairing..." : "Fix Channels & VM Browser"}
                       </button>
                     )}
+
+                    {canOpenSession && (
+                      <button
+                        onClick={handleRestartGateway}
+                        disabled={restartingGateway || openingControlUi}
+                        className="inline-flex items-center justify-center gap-2 rounded-full border border-[#DCDCDC] bg-white px-5 py-2.5 text-sm font-semibold text-[#111] transition hover:bg-[#F6F6F6] disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {restartingGateway ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <RefreshCw className="h-4 w-4" />
+                        )}
+                        {restartingGateway ? "Restarting..." : "Restart Gateway"}
+                      </button>
+                    )}
+
+                    {canOpenSession && (
+                      <button
+                        onClick={handleUpdateControlUi}
+                        disabled={updatingControlUi || openingControlUi}
+                        className="inline-flex items-center justify-center gap-2 rounded-full border border-[#DCDCDC] bg-white px-5 py-2.5 text-sm font-semibold text-[#111] transition hover:bg-[#F6F6F6] disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {updatingControlUi ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <RefreshCw className="h-4 w-4" />
+                        )}
+                        {updatingControlUi ? "Syncing UI..." : "Sync Workspace UI"}
+                      </button>
+                    )}
                   </>
                 )}
               </div>
@@ -1570,9 +1729,9 @@ export default function ClawNowPage() {
               {canOpenSession && (
                 <div className="mt-4 rounded-2xl border border-[#EFEFEF] bg-[#FAFAFA] px-4 py-3 text-sm text-[#555]">
                   <p>
-                    Browser automation now focuses on <strong>VM-side browser</strong>. Launch Gateway,
-                    then click <strong>Open Desktop Live</strong> in the Gateway top bar to watch the
-                    agent operate in real time.
+                    Browser automation now focuses on <strong>VM-side browser</strong>. Launch
+                    Gateway, then click <strong>Open Desktop Live</strong> in the Gateway top bar to
+                    watch the agent operate in real time.
                   </p>
                   <div className="mt-3 flex flex-wrap items-center gap-2">
                     <a
@@ -1586,8 +1745,8 @@ export default function ClawNowPage() {
                     </a>
                   </div>
                   <p className="mt-2 text-xs text-[#777]">
-                    Recommended browser profile: <code>openclaw</code>. This route keeps execution in
-                    the VM and visible via Desktop Live.
+                    Recommended browser profile: <code>openclaw</code>. This route keeps execution
+                    in the VM and visible via Desktop Live.
                   </p>
                 </div>
               )}
@@ -1628,8 +1787,8 @@ export default function ClawNowPage() {
 
               {onboardingCompleted && (
                 <p className="mt-3 text-xs text-[#0B7A2A]">
-                  Setup wizard completed. Launch Gateway, then use Desktop Live to observe VM browser
-                  actions.
+                  Setup wizard completed. Launch Gateway, then use Desktop Live to observe VM
+                  browser actions.
                 </p>
               )}
 

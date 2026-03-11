@@ -129,9 +129,9 @@ function isLoopbackRemoteAddress(remoteAddress) {
 function hasForwardedHeaders(req) {
   return Boolean(
     req.headers["x-forwarded-for"] ||
-      req.headers["x-real-ip"] ||
-      req.headers["x-forwarded-host"] ||
-      req.headers["x-forwarded-proto"],
+    req.headers["x-real-ip"] ||
+    req.headers["x-forwarded-host"] ||
+    req.headers["x-forwarded-proto"],
   );
 }
 
@@ -519,6 +519,67 @@ function writeBootstrapResponse(res, config) {
   }
 }
 
+function normalizeHttpUrl(raw) {
+  const value = typeof raw === "string" ? raw.trim() : "";
+  if (!value) {
+    return null;
+  }
+  try {
+    const parsed = new URL(value);
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      return null;
+    }
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function readJsonBody(req, maxBytes = 32 * 1024) {
+  return await new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+
+    req.on("data", (chunk) => {
+      if (!chunk) {
+        return;
+      }
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      total += buffer.length;
+      if (total > maxBytes) {
+        reject(new Error("payload_too_large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(buffer);
+    });
+
+    req.on("end", () => {
+      if (chunks.length === 0) {
+        resolve({});
+        return;
+      }
+      const raw = Buffer.concat(chunks).toString("utf8").trim();
+      if (!raw) {
+        resolve({});
+        return;
+      }
+      try {
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          reject(new Error("invalid_json_object"));
+          return;
+        }
+        resolve(parsed);
+      } catch {
+        reject(new Error("invalid_json"));
+      }
+    });
+
+    req.on("error", reject);
+  });
+}
+
 function enforceGatewayTrustedProxyConfig(config) {
   const stateDir = "/root/.openclaw";
   const configPath = `${stateDir}/openclaw.json`;
@@ -541,7 +602,9 @@ function enforceGatewayTrustedProxyConfig(config) {
   // keeping public browser traffic on managed trusted-proxy auth.
   next.gateway.mode = "remote";
   next.gateway.remote =
-    next.gateway.remote && typeof next.gateway.remote === "object" && !Array.isArray(next.gateway.remote)
+    next.gateway.remote &&
+    typeof next.gateway.remote === "object" &&
+    !Array.isArray(next.gateway.remote)
       ? next.gateway.remote
       : {};
   next.gateway.remote.url = localGatewayUrl;
@@ -573,7 +636,9 @@ function enforceGatewayTrustedProxyConfig(config) {
   next.gateway.controlUi.basePath = next.gateway.controlUi.basePath || config.controlPrefix;
   next.gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback = true;
   next.update =
-    next.update && typeof next.update === "object" && !Array.isArray(next.update) ? next.update : {};
+    next.update && typeof next.update === "object" && !Array.isArray(next.update)
+      ? next.update
+      : {};
   // Platform-managed upgrades: keep VM-side update prompts/auto-updates disabled.
   next.update.checkOnStart = false;
   next.update.auto =
@@ -676,6 +741,145 @@ async function handleGatewayRepair(req, res, config) {
   res.end(JSON.stringify({ success: true, service: "clawnow-proxy", repaired: true, details }));
 }
 
+async function handleControlUiRepair(req, res, config) {
+  if ((req.method || "").toUpperCase() !== "POST") {
+    writeHttpError(res, 405, "method_not_allowed", "Use POST to update control UI");
+    return;
+  }
+
+  let payload = {};
+  try {
+    payload = await readJsonBody(req);
+  } catch (error) {
+    const reason = String(error?.message || "");
+    if (reason === "payload_too_large") {
+      writeHttpError(res, 413, "payload_too_large", "Control UI update payload is too large");
+      return;
+    }
+    writeHttpError(res, 400, "invalid_json", "Control UI update body must be valid JSON");
+    return;
+  }
+
+  const data = payload && typeof payload === "object" ? payload : {};
+  const manifestUrl =
+    normalizeHttpUrl(data.manifestUrl) || normalizeHttpUrl(config.controlUiManifestUrl) || null;
+  if (!manifestUrl) {
+    writeHttpError(
+      res,
+      400,
+      "manifest_missing",
+      "Control UI manifest URL missing (provide manifestUrl or set CLAWNOW_CONTROL_UI_MANIFEST_URL)",
+    );
+    return;
+  }
+
+  const updaterScriptPath = config.controlUiUpdaterScriptPath;
+  const updaterScriptUrl =
+    normalizeHttpUrl(data.updaterScriptUrl) || normalizeHttpUrl(config.controlUiUpdaterScriptUrl);
+  const force = data.force === true;
+  const details = {
+    manifestUrl,
+    updaterScriptPath,
+    controlUiInstallRoot: config.controlUiInstallRoot,
+    scriptDownloaded: false,
+    updated: false,
+    currentRoot: null,
+    checkedAt: new Date().toISOString(),
+  };
+
+  if (updaterScriptUrl) {
+    fs.mkdirSync(path.dirname(updaterScriptPath), { recursive: true });
+    const downloadRes = spawnSync("curl", ["-fsSL", updaterScriptUrl, "-o", updaterScriptPath], {
+      encoding: "utf8",
+      timeout: 15_000,
+      maxBuffer: 512 * 1024,
+    });
+    if (downloadRes.error || downloadRes.status !== 0) {
+      const message = downloadRes.error
+        ? String(downloadRes.error?.message || downloadRes.error)
+        : `${downloadRes.status}: ${(downloadRes.stderr || downloadRes.stdout || "").trim() || "unknown error"}`;
+      writeHttpError(
+        res,
+        502,
+        "updater_download_failed",
+        `Failed to download control UI updater script: ${message}`,
+      );
+      return;
+    }
+    const chmodRes = spawnSync("chmod", ["+x", updaterScriptPath], {
+      encoding: "utf8",
+      timeout: 6000,
+      maxBuffer: 256 * 1024,
+    });
+    if (chmodRes.error || chmodRes.status !== 0) {
+      const message = chmodRes.error
+        ? String(chmodRes.error?.message || chmodRes.error)
+        : `${chmodRes.status}: ${(chmodRes.stderr || chmodRes.stdout || "").trim() || "unknown error"}`;
+      writeHttpError(
+        res,
+        502,
+        "updater_chmod_failed",
+        `Failed to mark control UI updater executable: ${message}`,
+      );
+      return;
+    }
+    details.scriptDownloaded = true;
+  }
+
+  if (!fs.existsSync(updaterScriptPath)) {
+    writeHttpError(
+      res,
+      404,
+      "updater_missing",
+      "Control UI updater script is missing on VM and no updaterScriptUrl was provided",
+    );
+    return;
+  }
+
+  const updaterArgs = [
+    updaterScriptPath,
+    "--manifest-url",
+    manifestUrl,
+    "--install-root",
+    config.controlUiInstallRoot,
+    "--print-root",
+  ];
+  if (force) {
+    updaterArgs.push("--force");
+  }
+  const updateRes = spawnSync("bash", updaterArgs, {
+    encoding: "utf8",
+    timeout: 90_000,
+    maxBuffer: 2 * 1024 * 1024,
+  });
+  if (updateRes.error || updateRes.status !== 0) {
+    const message = updateRes.error
+      ? String(updateRes.error?.message || updateRes.error)
+      : `${updateRes.status}: ${(updateRes.stderr || updateRes.stdout || "").trim() || "unknown error"}`;
+    writeHttpError(res, 502, "control_ui_update_failed", `Control UI updater failed: ${message}`);
+    return;
+  }
+
+  const outputLines = String(updateRes.stdout || "")
+    .split(/\r?\n/g)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const currentRoot = outputLines.length > 0 ? outputLines[outputLines.length - 1] : null;
+  details.currentRoot = currentRoot;
+  details.updated = /updated control ui to /i.test(String(updateRes.stdout || ""));
+
+  res.statusCode = 200;
+  res.setHeader("content-type", "application/json; charset=utf-8");
+  res.end(
+    JSON.stringify({
+      success: true,
+      service: "clawnow-proxy",
+      repaired: true,
+      details,
+    }),
+  );
+}
+
 function shouldUseRoute(pathname, prefix) {
   return pathname === prefix || pathname.startsWith(`${prefix}/`);
 }
@@ -713,10 +917,7 @@ function buildTargetPath(route, requestUrl) {
   }
 
   const expectedSessionTypes = normalizeExpectedSessionTypes(route.expectedSessionType);
-  if (
-    expectedSessionTypes.length > 0 &&
-    !expectedSessionTypes.includes(route.claims.sessionType)
-  ) {
+  if (expectedSessionTypes.length > 0 && !expectedSessionTypes.includes(route.claims.sessionType)) {
     throw new Error("session_type_mismatch");
   }
 
@@ -735,7 +936,10 @@ function createProxyConfig() {
     bind: process.env.CLAWNOW_PROXY_BIND?.trim() || "127.0.0.1",
     port: parsePort(process.env.CLAWNOW_PROXY_PORT, 18790),
     sharedSecret,
-    tokenClockSkewSeconds: parsePositiveInt(process.env.CLAWNOW_PROXY_TOKEN_CLOCK_SKEW_SECONDS, 120),
+    tokenClockSkewSeconds: parsePositiveInt(
+      process.env.CLAWNOW_PROXY_TOKEN_CLOCK_SKEW_SECONDS,
+      120,
+    ),
     expectedIss: process.env.CLAWNOW_PROXY_EXPECTED_ISS?.trim() || "clawnow-control-plane",
     expectedAud: process.env.CLAWNOW_PROXY_EXPECTED_AUD?.trim() || "openclaw-gateway",
     instanceId: process.env.CLAWNOW_INSTANCE_ID?.trim() || "local",
@@ -751,6 +955,13 @@ function createProxyConfig() {
       "/__clawnow/bootstrap",
     ),
     repairPrefix: normalizePrefix(process.env.CLAWNOW_PROXY_REPAIR_PREFIX, "/__clawnow/repair"),
+    controlUiManifestUrl: process.env.CLAWNOW_CONTROL_UI_MANIFEST_URL?.trim() || "",
+    controlUiUpdaterScriptPath:
+      process.env.CLAWNOW_CONTROL_UI_UPDATER_SCRIPT_PATH?.trim() ||
+      "/opt/clawnow/clawnow-control-ui-updater.sh",
+    controlUiUpdaterScriptUrl: process.env.CLAWNOW_CONTROL_UI_UPDATER_SCRIPT_URL?.trim() || "",
+    controlUiInstallRoot:
+      process.env.CLAWNOW_CONTROL_UI_INSTALL_ROOT?.trim() || "/opt/clawnow/control-ui",
     bootstrapStateFile:
       process.env.CLAWNOW_BOOTSTRAP_STATE_FILE?.trim() || "/var/lib/clawnow/bootstrap-state.json",
     stripControlPrefix: parseBoolean(process.env.CLAWNOW_PROXY_STRIP_CONTROL_PREFIX, false),
@@ -1034,6 +1245,10 @@ function createServer(config) {
       const suffix = requestUrl.pathname.slice(route.prefix.length) || "/";
       if (suffix === "/gateway" || suffix === "/gateway/" || suffix === "/") {
         void handleGatewayRepair(req, res, config);
+        return;
+      }
+      if (suffix === "/control-ui" || suffix === "/control-ui/") {
+        void handleControlUiRepair(req, res, config);
         return;
       }
       writeHttpError(res, 404, "route_not_found", "Unknown ClawNow repair route");
