@@ -309,9 +309,10 @@ function detectTaskSourceFromMetadata(
 
 function maskSensitiveString(raw: string): string {
   let next = raw;
-  next = next.replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[masked-email]");
+  // JID patterns must run before the generic email regex (they'd otherwise match as email)
   next = next.replace(/\b\d{5,}(?:-\d+)?@g\.us\b/gi, "[masked-jid]");
   next = next.replace(/\b\d{5,}@s\.whatsapp\.net\b/gi, "[masked-jid]");
+  next = next.replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[masked-email]");
   next = next.replace(/\bsk-[A-Za-z0-9_-]{10,}\b/g, "[masked-token]");
   next = next.replace(
     /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
@@ -1170,7 +1171,9 @@ export class TaskTraceStore {
     const errorText = summarizeUnknown(event.data?.error, 220);
     const preview =
       terminalStatus === "error"
-        ? errorText || "Task failed"
+        ? errorText
+          ? `Task failed: ${errorText}`
+          : "Task failed"
         : terminalStatus === "timeout"
           ? "Task timed out"
           : run.summary.preview || "Task completed";
