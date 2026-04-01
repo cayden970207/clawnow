@@ -317,6 +317,7 @@ function getCookieToken(req, expectedSessionType) {
   }
   return (
     cookies[getCookieNameForSessionType("control_ui")] ||
+    cookies[getCookieNameForSessionType("desktop")] ||
     cookies[getCookieNameForSessionType("novnc")] ||
     null
   );
@@ -467,18 +468,18 @@ function checkTcpConnectivity(params) {
 async function writeHealthResponse(res, config) {
   const openclawTarget = resolveTarget(config.openclawUpstream);
   const openclaw = await checkTcpConnectivity({ ...openclawTarget, timeoutMs: 700 });
-  const novncTarget = config.novncUpstream ? resolveTarget(config.novncUpstream) : null;
-  const novnc = novncTarget ? await checkTcpConnectivity({ ...novncTarget, timeoutMs: 700 }) : null;
+  const desktopTarget = config.desktopUpstream ? resolveTarget(config.desktopUpstream) : null;
+  const desktop = desktopTarget ? await checkTcpConnectivity({ ...desktopTarget, timeoutMs: 700 }) : null;
 
-  const success = openclaw.ok && (novnc ? novnc.ok : true);
+  const success = openclaw.ok && (desktop ? desktop.ok : true);
   const payload = {
     success,
     service: "clawnow-proxy",
     checkedAt: new Date().toISOString(),
     upstream: {
       openclaw: { ...openclawTarget, ok: openclaw.ok, error: openclaw.error },
-      ...(novncTarget
-        ? { novnc: { ...novncTarget, ok: novnc?.ok === true, error: novnc?.error ?? null } }
+      ...(desktopTarget
+        ? { desktop: { ...desktopTarget, ok: desktop?.ok === true, error: desktop?.error ?? null } }
         : {}),
     },
     ...(success
@@ -519,10 +520,75 @@ function writeBootstrapResponse(res, config) {
   }
 }
 
+function normalizeHttpUrl(raw) {
+  const value = typeof raw === "string" ? raw.trim() : "";
+  if (!value) {
+    return null;
+  }
+  try {
+    const parsed = new URL(value);
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      return null;
+    }
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function readJsonBody(req, maxBytes = 32 * 1024) {
+  return await new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+
+    req.on("data", (chunk) => {
+      if (!chunk) {
+        return;
+      }
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      total += buffer.length;
+      if (total > maxBytes) {
+        reject(new Error("payload_too_large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(buffer);
+    });
+
+    req.on("end", () => {
+      if (chunks.length === 0) {
+        resolve({});
+        return;
+      }
+      const raw = Buffer.concat(chunks).toString("utf8").trim();
+      if (!raw) {
+        resolve({});
+        return;
+      }
+      try {
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          reject(new Error("invalid_json_object"));
+          return;
+        }
+        resolve(parsed);
+      } catch {
+        reject(new Error("invalid_json"));
+      }
+    });
+
+    req.on("error", reject);
+  });
+}
+
 function enforceGatewayTrustedProxyConfig(config) {
   const stateDir = "/root/.openclaw";
+  const credentialsDir = `${stateDir}/credentials`;
   const configPath = `${stateDir}/openclaw.json`;
   fs.mkdirSync(stateDir, { recursive: true });
+  fs.mkdirSync(credentialsDir, { recursive: true });
+  fs.chmodSync(stateDir, 0o700);
+  fs.chmodSync(credentialsDir, 0o700);
 
   let existing = {};
   if (fs.existsSync(configPath)) {
@@ -560,6 +626,9 @@ function enforceGatewayTrustedProxyConfig(config) {
     "x-clawnow-instance-id",
     "x-clawnow-session-type",
   ];
+  if (config.trustedProxyUser) {
+    next.gateway.auth.trustedProxy.allowUsers = [config.trustedProxyUser];
+  }
 
   // Ensure we do not accidentally fall back to token/password auth.
   delete next.gateway.auth.token;
@@ -573,7 +642,7 @@ function enforceGatewayTrustedProxyConfig(config) {
   next.gateway.trustedProxies = ["127.0.0.2", "::1"];
   next.gateway.controlUi = next.gateway.controlUi || {};
   next.gateway.controlUi.basePath = next.gateway.controlUi.basePath || config.controlPrefix;
-  next.gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback = true;
+  next.gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback = false;
   next.update =
     next.update && typeof next.update === "object" && !Array.isArray(next.update)
       ? next.update
@@ -585,9 +654,9 @@ function enforceGatewayTrustedProxyConfig(config) {
       ? next.update.auto
       : {};
   next.update.auto.enabled = false;
-  // ClawNow proxy is the trust boundary; skip browser pairing ceremony so
-  // Control UI connections do not fail on device identity checks.
-  next.gateway.controlUi.dangerouslyDisableDeviceAuth = true;
+  // ClawNow proxy is the trust boundary for managed browser sessions.
+  next.gateway.controlUi.trustProxyAuth = true;
+  delete next.gateway.controlUi.dangerouslyDisableDeviceAuth;
 
   fs.writeFileSync(configPath, `${JSON.stringify(next, null, 2)}\n`);
   return { configPath };
@@ -680,6 +749,158 @@ async function handleGatewayRepair(req, res, config) {
   res.end(JSON.stringify({ success: true, service: "clawnow-proxy", repaired: true, details }));
 }
 
+async function handleWorkspaceReleaseSync(req, res, config) {
+  if ((req.method || "").toUpperCase() !== "POST") {
+    writeHttpError(res, 405, "method_not_allowed", "Use POST to sync the workspace release");
+    return;
+  }
+
+  let payload = {};
+  try {
+    payload = await readJsonBody(req);
+  } catch (error) {
+    const reason = String(error?.message || "");
+    if (reason === "payload_too_large") {
+      writeHttpError(res, 413, "payload_too_large", "Workspace release sync payload is too large");
+      return;
+    }
+    writeHttpError(res, 400, "invalid_json", "Workspace release sync body must be valid JSON");
+    return;
+  }
+
+  const data = payload && typeof payload === "object" ? payload : {};
+  const manifestUrl =
+    normalizeHttpUrl(data.manifestUrl) || normalizeHttpUrl(config.controlUiManifestUrl) || null;
+  if (!manifestUrl) {
+    writeHttpError(
+      res,
+      400,
+      "manifest_missing",
+      "Workspace release manifest URL missing (provide manifestUrl or set CLAWNOW_CONTROL_UI_MANIFEST_URL)",
+    );
+    return;
+  }
+
+  const updaterScriptPath = config.controlUiUpdaterScriptPath;
+  const updaterScriptUrl =
+    normalizeHttpUrl(data.updaterScriptUrl) || normalizeHttpUrl(config.controlUiUpdaterScriptUrl);
+  const proxyScriptUrl = normalizeHttpUrl(data.proxyScriptUrl);
+  const force = data.force === true;
+  const details = {
+    manifestUrl,
+    updaterScriptPath,
+    proxyScriptUrl,
+    controlUiInstallRoot: config.controlUiInstallRoot,
+    scriptDownloaded: false,
+    updated: false,
+    currentRoot: null,
+    checkedAt: new Date().toISOString(),
+  };
+
+  if (updaterScriptUrl) {
+    fs.mkdirSync(path.dirname(updaterScriptPath), { recursive: true });
+    const downloadRes = spawnSync("curl", ["-fsSL", updaterScriptUrl, "-o", updaterScriptPath], {
+      encoding: "utf8",
+      timeout: 15_000,
+      maxBuffer: 512 * 1024,
+    });
+    if (downloadRes.error || downloadRes.status !== 0) {
+      const message = downloadRes.error
+        ? String(downloadRes.error?.message || downloadRes.error)
+        : `${downloadRes.status}: ${(downloadRes.stderr || downloadRes.stdout || "").trim() || "unknown error"}`;
+      writeHttpError(
+        res,
+        502,
+        "updater_download_failed",
+        `Failed to download workspace release updater script: ${message}`,
+      );
+      return;
+    }
+    const chmodRes = spawnSync("chmod", ["+x", updaterScriptPath], {
+      encoding: "utf8",
+      timeout: 6000,
+      maxBuffer: 256 * 1024,
+    });
+    if (chmodRes.error || chmodRes.status !== 0) {
+      const message = chmodRes.error
+        ? String(chmodRes.error?.message || chmodRes.error)
+        : `${chmodRes.status}: ${(chmodRes.stderr || chmodRes.stdout || "").trim() || "unknown error"}`;
+      writeHttpError(
+        res,
+        502,
+        "updater_chmod_failed",
+        `Failed to mark workspace release updater executable: ${message}`,
+      );
+      return;
+    }
+    details.scriptDownloaded = true;
+  }
+
+  if (!fs.existsSync(updaterScriptPath)) {
+    writeHttpError(
+      res,
+      404,
+      "updater_missing",
+      "Workspace release updater script is missing on VM and no updaterScriptUrl was provided",
+    );
+    return;
+  }
+
+  const updaterArgs = [
+    updaterScriptPath,
+    "--manifest-url",
+    manifestUrl,
+    "--install-root",
+    config.controlUiInstallRoot,
+    "--print-root",
+  ];
+  if (proxyScriptUrl) {
+    updaterArgs.push("--proxy-script-url", proxyScriptUrl);
+  }
+  if (force) {
+    updaterArgs.push("--force");
+  }
+  const updateRes = spawnSync("bash", updaterArgs, {
+    encoding: "utf8",
+    timeout: 90_000,
+    maxBuffer: 2 * 1024 * 1024,
+  });
+  if (updateRes.error || updateRes.status !== 0) {
+    const message = updateRes.error
+      ? String(updateRes.error?.message || updateRes.error)
+      : `${updateRes.status}: ${(updateRes.stderr || updateRes.stdout || "").trim() || "unknown error"}`;
+    writeHttpError(
+      res,
+      502,
+      "workspace_release_sync_failed",
+      `Workspace release updater failed: ${message}`,
+    );
+    return;
+  }
+
+  const outputLines = String(updateRes.stdout || "")
+    .split(/\r?\n/g)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const currentRoot = outputLines.length > 0 ? outputLines[outputLines.length - 1] : null;
+  details.currentRoot = currentRoot;
+  details.updated =
+    /(updated control ui to |updated openclaw backend to |repaired managed gateway defaults)/i.test(
+      String(updateRes.stdout || ""),
+    );
+
+  res.statusCode = 200;
+  res.setHeader("content-type", "application/json; charset=utf-8");
+  res.end(
+    JSON.stringify({
+      success: true,
+      service: "clawnow-proxy",
+      repaired: true,
+      details,
+    }),
+  );
+}
+
 function shouldUseRoute(pathname, prefix) {
   return pathname === prefix || pathname.startsWith(`${prefix}/`);
 }
@@ -744,6 +965,12 @@ function createProxyConfig() {
     expectedAud: process.env.CLAWNOW_PROXY_EXPECTED_AUD?.trim() || "openclaw-gateway",
     instanceId: process.env.CLAWNOW_INSTANCE_ID?.trim() || "local",
     controlPrefix: normalizePrefix(process.env.CLAWNOW_PROXY_CONTROL_PREFIX, "/clawnow"),
+    desktopPrefix: normalizePrefix(
+      process.env.CLAWNOW_PROXY_DESKTOP_PREFIX ||
+        process.env.CLAWNOW_PROXY_NOVNC_PREFIX,
+      "/desktop",
+    ),
+    /** @deprecated Use desktopPrefix. */
     novncPrefix: normalizePrefix(process.env.CLAWNOW_PROXY_NOVNC_PREFIX, "/novnc"),
     localGatewayPrefix: normalizePrefix(
       process.env.CLAWNOW_PROXY_LOCAL_GATEWAY_PREFIX,
@@ -755,17 +982,31 @@ function createProxyConfig() {
       "/__clawnow/bootstrap",
     ),
     repairPrefix: normalizePrefix(process.env.CLAWNOW_PROXY_REPAIR_PREFIX, "/__clawnow/repair"),
+    controlUiManifestUrl: process.env.CLAWNOW_CONTROL_UI_MANIFEST_URL?.trim() || "",
+    controlUiUpdaterScriptPath:
+      process.env.CLAWNOW_CONTROL_UI_UPDATER_SCRIPT_PATH?.trim() ||
+      "/opt/clawnow/clawnow-control-ui-updater.sh",
+    controlUiUpdaterScriptUrl: process.env.CLAWNOW_CONTROL_UI_UPDATER_SCRIPT_URL?.trim() || "",
+    controlUiInstallRoot:
+      process.env.CLAWNOW_CONTROL_UI_INSTALL_ROOT?.trim() || "/opt/clawnow/control-ui",
     bootstrapStateFile:
       process.env.CLAWNOW_BOOTSTRAP_STATE_FILE?.trim() || "/var/lib/clawnow/bootstrap-state.json",
     stripControlPrefix: parseBoolean(process.env.CLAWNOW_PROXY_STRIP_CONTROL_PREFIX, false),
-    stripNoVncPrefix: parseBoolean(process.env.CLAWNOW_PROXY_STRIP_NOVNC_PREFIX, true),
+    stripDesktopPrefix: parseBoolean(
+      process.env.CLAWNOW_PROXY_STRIP_DESKTOP_PREFIX ?? process.env.CLAWNOW_PROXY_STRIP_NOVNC_PREFIX,
+      true,
+    ),
     openclawUpstream: parseUpstream("CLAWNOW_OPENCLAW_UPSTREAM", "http://127.0.0.1:18789"),
+    trustedProxyUser: process.env.CLAWNOW_TRUSTED_PROXY_USER?.trim() || "",
     openclawLocalAddress: parseLoopbackLocalAddress(
       process.env.CLAWNOW_OPENCLAW_LOCAL_ADDRESS,
       "127.0.0.2",
     ),
     openclawService: process.env.CLAWNOW_OPENCLAW_SERVICE?.trim() || "openclaw-gateway.service",
-    novncUpstream: parseUpstream("CLAWNOW_NOVNC_UPSTREAM", "http://127.0.0.1:6080"),
+    desktopUpstream: parseUpstream(
+      "CLAWNOW_DESKTOP_UPSTREAM",
+      parseUpstream("CLAWNOW_NOVNC_UPSTREAM", "http://127.0.0.1:8080"),
+    ),
   };
 }
 
@@ -779,17 +1020,30 @@ function resolveRoute(config, pathname) {
   if (shouldUseRoute(pathname, config.repairPrefix)) {
     return { kind: "repair", prefix: config.repairPrefix };
   }
-  if (shouldUseRoute(pathname, config.novncPrefix)) {
-    if (!config.novncUpstream) {
-      return { kind: "missing-novnc" };
+  if (shouldUseRoute(pathname, config.desktopPrefix)) {
+    if (!config.desktopUpstream) {
+      return { kind: "missing-desktop" };
+    }
+    return {
+      kind: "proxy",
+      prefix: config.desktopPrefix,
+      stripPrefix: config.stripDesktopPrefix,
+      // Allow gateway control-ui sessions to open the desktop viewer directly from the dashboard.
+      expectedSessionType: ["desktop", "control_ui", "novnc"],
+      upstream: config.desktopUpstream,
+    };
+  }
+  // Backward-compatible: accept legacy /novnc route and redirect to /desktop.
+  if (config.novncPrefix && shouldUseRoute(pathname, config.novncPrefix)) {
+    if (!config.desktopUpstream) {
+      return { kind: "missing-desktop" };
     }
     return {
       kind: "proxy",
       prefix: config.novncPrefix,
-      stripPrefix: config.stripNoVncPrefix,
-      // Allow gateway control-ui sessions to open noVNC directly from the dashboard.
-      expectedSessionType: ["novnc", "control_ui"],
-      upstream: config.novncUpstream,
+      stripPrefix: true,
+      expectedSessionType: ["desktop", "control_ui", "novnc"],
+      upstream: config.desktopUpstream,
     };
   }
   if (shouldUseRoute(pathname, config.localGatewayPrefix)) {
@@ -985,8 +1239,12 @@ function parseAndValidateToken(req, config, expectedSessionType) {
 
 function buildLoopbackClaims(config) {
   const nowSeconds = Math.floor(Date.now() / 1000);
+  // VM-local CLI/agent traffic still traverses the managed trusted-proxy path.
+  // Reuse the platform-issued trusted proxy user when available so gateway
+  // allowUsers enforcement accepts these loopback-only requests.
+  const trustedLoopbackUser = config.trustedProxyUser || "loopback@local";
   return {
-    sub: "loopback@local",
+    sub: trustedLoopbackUser,
     iss: config.expectedIss,
     aud: config.expectedAud,
     exp: nowSeconds + 3600,
@@ -1040,12 +1298,16 @@ function createServer(config) {
         void handleGatewayRepair(req, res, config);
         return;
       }
+      if (suffix === "/release" || suffix === "/release/") {
+        void handleWorkspaceReleaseSync(req, res, config);
+        return;
+      }
       writeHttpError(res, 404, "route_not_found", "Unknown ClawNow repair route");
       return;
     }
 
-    if (route.kind === "missing-novnc") {
-      writeHttpError(res, 503, "novnc_unavailable", "CLAWNOW_NOVNC_UPSTREAM is not configured");
+    if (route.kind === "missing-desktop") {
+      writeHttpError(res, 503, "desktop_unavailable", "CLAWNOW_DESKTOP_UPSTREAM is not configured");
       return;
     }
 
@@ -1093,12 +1355,12 @@ function main() {
   const config = createProxyConfig();
   const server = createServer(config);
   server.listen(config.port, config.bind, () => {
-    const novncTarget = config.novncUpstream ? config.novncUpstream.toString() : "(disabled)";
+    const desktopTarget = config.desktopUpstream ? config.desktopUpstream.toString() : "(disabled)";
     console.log(
       `[clawnow-proxy] listening on http://${config.bind}:${config.port}\n` +
         `  control: ${config.controlPrefix} -> ${config.openclawUpstream.toString()}\n` +
         `  local:   ${config.localGatewayPrefix} (loopback-only) -> ${config.openclawUpstream.toString()}\n` +
-        `  novnc:   ${config.novncPrefix} -> ${novncTarget}`,
+        `  desktop: ${config.desktopPrefix} -> ${desktopTarget}`,
     );
   });
 }
