@@ -17,8 +17,15 @@ import {
 } from "@/lib/services/clawnow-hetzner.service";
 import {
   buildClawNowGatewayDefaultsPatch,
+  buildClawNowTrustedProxyAllowUsersPatch,
   OPENAI_MEMORY_EMBED_MODEL,
 } from "./clawnow-gateway-defaults";
+import {
+  describeGatewayPayloadError,
+  formatGatewayBootstrapFailureReason,
+  isGatewayBootstrapFailure,
+  parseGatewayBootstrapState,
+} from "./clawnow-gateway-probe";
 
 export type ClawInstanceStatus =
   | "provisioning"
@@ -29,7 +36,7 @@ export type ClawInstanceStatus =
   | "deleting"
   | "terminated";
 
-export type ClawSessionType = "control_ui" | "novnc";
+export type ClawSessionType = "control_ui" | "desktop" | "novnc";
 
 export interface ClawInstance {
   id: string;
@@ -45,10 +52,14 @@ export interface ClawInstance {
   ipv6: string | null;
   gateway_url: string | null;
   control_ui_url: string | null;
+  desktop_url: string | null;
+  /** @deprecated Use desktop_url. */
   novnc_url: string | null;
   provisioning_started_at: string;
   provisioned_at: string | null;
   last_heartbeat_at: string | null;
+  desktop_enabled_until: string | null;
+  /** @deprecated Use desktop_enabled_until. */
   novnc_enabled_until: string | null;
   last_error: string | null;
   metadata: Record<string, unknown>;
@@ -147,6 +158,12 @@ interface OrganizationSubscriptionBalanceRow {
 
 type ClawNowWizardAuthMethod = "openai_api_key" | "openai_codex_oauth";
 
+interface PendingGatewayAuthState {
+  providerId: "openai-codex";
+  accessToken: string;
+  createdAtMs: number;
+}
+
 const CLAWNOW_WIZARD_STEP_AUTH_METHOD = "clawnow.setup.auth_method";
 const CLAWNOW_WIZARD_STEP_OPENAI_API_KEY = "clawnow.setup.openai_api_key";
 const CLAWNOW_WIZARD_STEP_CODEX_CALLBACK_URL = "clawnow.setup.codex_callback_url";
@@ -186,6 +203,7 @@ interface ClawNowConfig {
   defaultCloudInit: string;
   openClawBootstrapCommand: string;
   openClawVersion: string | null;
+  openClawInstallSpec: string | null;
 }
 
 interface GatewayDeviceIdentity {
@@ -196,14 +214,16 @@ interface GatewayDeviceIdentity {
 
 const DEFAULT_PROVISIONING_TIMEOUT_SECONDS = 15 * 60;
 const GATEWAY_HEALTH_TIMEOUT_MS = 8000;
+const GATEWAY_BOOTSTRAP_TIMEOUT_MS = 3000;
 const GATEWAY_LAUNCH_PROBE_TIMEOUT_MS = 12000;
 const GATEWAY_WS_TIMEOUT_MS = 20_000;
 const GATEWAY_DIAGNOSE_PROBE_TIMEOUT_MS = 8_000;
 const GATEWAY_CONFIG_PATCH_MAX_ATTEMPTS = 3;
 const GATEWAY_CONFIG_PATCH_RETRY_DELAY_MS = 400;
 const GATEWAY_HEALTH_PATH = "__clawnow/health";
+const GATEWAY_BOOTSTRAP_PATH = "__clawnow/bootstrap";
 const GATEWAY_REPAIR_PATH = "__clawnow/repair/gateway";
-const CONTROL_UI_REPAIR_PATH = "__clawnow/repair/control-ui";
+const WORKSPACE_RELEASE_SYNC_PATH = "__clawnow/repair/release";
 // First boot can be slow (apt + Node + OpenClaw + desktop/browser deps). Avoid
 // marking the VM as errored too early; defer hard failure to provisioningTimeoutSeconds.
 const GATEWAY_UPSTREAM_BOOT_TIMEOUT_MS = 12 * 60 * 1000;
@@ -224,16 +244,16 @@ const OPENAI_CODEX_OAUTH_REDIRECT_URI = "http://localhost:1455/auth/callback";
 const OPENAI_CODEX_OAUTH_SCOPE = "openid profile email offline_access";
 const OPENAI_CODEX_OAUTH_ORIGINATOR = "pi";
 const OPENAI_CODEX_OAUTH_SESSION_TTL_MS = 30 * 60 * 1000;
-const CLAWNOW_DEFAULT_OPENCLAW_VERSION = "2026.2.23";
+const CLAWNOW_DEFAULT_OPENCLAW_VERSION = "2026.3.13";
 const CLAWNOW_DEFAULT_CONTROL_SESSION_TTL_SECONDS = 2 * 60 * 60;
 const CLAWNOW_MIN_CONTROL_SESSION_TTL_SECONDS = 30 * 60;
 const DEFAULT_MAIN_SESSION_KEY = "main";
 const DEFAULT_BOOTSTRAP_SCRIPT_URL =
-  "https://raw.githubusercontent.com/openclaw/openclaw/main/scripts/clawnow-vm-bootstrap.sh";
+  "https://raw.githubusercontent.com/cayden970207/clawnow/main/clawnow-control-plane/scripts/clawnow-vm-bootstrap.sh";
 const DEFAULT_PROXY_SCRIPT_URL =
-  "https://raw.githubusercontent.com/openclaw/openclaw/main/scripts/clawnow-proxy.mjs";
+  "https://raw.githubusercontent.com/cayden970207/clawnow/main/clawnow-control-plane/scripts/clawnow-proxy.mjs";
 const DEFAULT_CONTROL_UI_UPDATER_SCRIPT_URL =
-  "https://raw.githubusercontent.com/openclaw/openclaw/main/clawnow-control-plane/scripts/clawnow-control-ui-updater.sh";
+  "https://raw.githubusercontent.com/cayden970207/clawnow/main/clawnow-control-plane/scripts/clawnow-control-ui-updater.sh";
 const LOCAL_BOOTSTRAP_SCRIPT_PATH = "api/clawnow/bootstrap/vm";
 const LOCAL_PROXY_SCRIPT_PATH = "api/clawnow/bootstrap/proxy";
 const LOCAL_CONTROL_UI_UPDATER_SCRIPT_PATH = "api/clawnow/bootstrap/control-ui-updater";
@@ -277,6 +297,9 @@ interface GatewayReadinessProbeResult {
   code?: string;
   openclawUpstreamReady?: boolean;
   openclawUpstreamError?: string;
+  bootstrapPhase?: string;
+  bootstrapStatus?: string;
+  bootstrapMessage?: string;
 }
 
 interface OnboardingCodexOAuthState {
@@ -432,6 +455,49 @@ function asObjectRecord(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>;
 }
 
+function getModelPrimaryValue(value: unknown): string {
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  const record = asObjectRecord(value);
+  return typeof record?.primary === "string" ? record.primary.trim() : "";
+}
+
+function resolveDefaultAgentIdFromGatewayConfig(configRaw: unknown): string {
+  const config = asObjectRecord(configRaw);
+  const agentsList = Array.isArray(asObjectRecord(config?.agents)?.list)
+    ? (asObjectRecord(config?.agents)?.list as unknown[])
+    : [];
+  if (agentsList.length === 0) {
+    return "main";
+  }
+  const normalizedEntries = agentsList
+    .map((entry) => asObjectRecord(entry))
+    .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+    .filter((entry) => typeof entry.id === "string" && entry.id.trim().length > 0);
+  if (normalizedEntries.length === 0) {
+    return "main";
+  }
+  const explicitDefault = normalizedEntries.find((entry) => entry.default === true);
+  const chosen = explicitDefault ?? normalizedEntries[0];
+  return typeof chosen.id === "string" && chosen.id.trim() ? chosen.id.trim() : "main";
+}
+
+function resolveGatewayPrimaryModelRef(configRaw: unknown): string {
+  const config = asObjectRecord(configRaw);
+  const agents = asObjectRecord(config?.agents);
+  const agentDefaults = asObjectRecord(agents?.defaults);
+  const agentsList = Array.isArray(agents?.list) ? agents.list : [];
+  const defaultAgentId = resolveDefaultAgentIdFromGatewayConfig(configRaw);
+  const defaultAgentEntry = agentsList
+    .map((entry) => asObjectRecord(entry))
+    .find(
+      (entry) =>
+        typeof entry?.id === "string" && entry.id.trim().toLowerCase() === defaultAgentId.toLowerCase(),
+    );
+  return getModelPrimaryValue(defaultAgentEntry?.model) || getModelPrimaryValue(agentDefaults?.model);
+}
+
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
 }
@@ -487,6 +553,10 @@ function loadClawNowConfig(): ClawNowConfig {
     ),
   );
 
+  const openClawInstallSpec = getOptionalEnv("CLAWNOW_OPENCLAW_INSTALL_SPEC") || null;
+  const openClawVersion =
+    getOptionalEnv("CLAWNOW_OPENCLAW_VERSION") || CLAWNOW_DEFAULT_OPENCLAW_VERSION;
+
   return {
     hetznerApiToken: getRequiredEnv("CLAWNOW_HETZNER_API_TOKEN"),
     hetznerLocation: getOptionalEnv("CLAWNOW_HETZNER_LOCATION") || "sin",
@@ -520,7 +590,8 @@ function loadClawNowConfig(): ClawNowConfig {
     ),
     defaultCloudInit: getOptionalEnv("CLAWNOW_HETZNER_CLOUD_INIT") || "",
     openClawBootstrapCommand: getOptionalEnv("CLAWNOW_OPENCLAW_BOOTSTRAP_COMMAND") || "",
-    openClawVersion: getOptionalEnv("CLAWNOW_OPENCLAW_VERSION") || CLAWNOW_DEFAULT_OPENCLAW_VERSION,
+    openClawVersion,
+    openClawInstallSpec,
   };
 }
 
@@ -572,6 +643,7 @@ export class ClawNowService {
       novncSessionTtlMinutes: this.config.novncSessionTtlMinutes,
       provisioningTimeoutSeconds: this.config.provisioningTimeoutSeconds,
       openClawVersion: this.config.openClawVersion || undefined,
+      openClawInstallSpec: this.config.openClawInstallSpec || undefined,
       gatewayBaseUrl: this.config.gatewayBaseUrl,
       gatewayMode: this.config.instanceGatewayTemplate ? "per_instance" : "shared_proxy",
       controlUiPath: this.config.controlUiPath,
@@ -992,7 +1064,10 @@ export class ClawNowService {
         }
 
         if (!gatewayProbe.ready) {
-          if (gatewayProbe.reason === LEGACY_HTTP_GATEWAY_REASON) {
+          if (gatewayProbe.code === "bootstrap_failed") {
+            derivedStatus = "error";
+            derivedError = gatewayProbe.reason || "OpenClaw bootstrap failed.";
+          } else if (gatewayProbe.reason === LEGACY_HTTP_GATEWAY_REASON) {
             derivedStatus = "error";
             derivedError =
               "This VM is running legacy HTTP gateway mode. Click Redeploy Claw to recreate it with HTTPS.";
@@ -1046,9 +1121,10 @@ export class ClawNowService {
         last_error: derivedError,
         ...provisionedAtPatch,
       });
+      const synced = await this.syncPendingGatewayAuthAfterHealthCheck(updated, userId);
 
       return {
-        instance: updated,
+        instance: synced,
         providerStatus: providerServer.status,
         checkedAt,
       };
@@ -1151,49 +1227,60 @@ export class ClawNowService {
       );
     }
 
-    const session = await this.createControlGatewaySession(health.instance, userId, requestMeta, {
+    let launchInstance = health.instance;
+
+    const session = await this.createControlGatewaySession(launchInstance, userId, requestMeta, {
       syncControlUiOrigins: true,
       strictControlUiOriginSync: true,
     });
 
-    // Best-effort auto-heal for existing workspaces:
-    // keep browser/channels defaults aligned to ClawNow without blocking launch.
-    try {
-      await this.applyClawNowGatewayDefaults({
-        gatewayWebSocketUrl: session.gatewayWebSocketUrl,
-        token: session.token,
-        force: false,
-      });
-    } catch (error) {
-      await this.logEvent(
-        health.instance.id,
-        userId,
-        "gateway.defaults.autoheal.failed",
-        `Failed to auto-heal gateway defaults during launch: ${safeErrorMessage(error)}`,
-        { error: safeErrorMessage(error) },
-        "warn",
-      );
-    }
+    launchInstance = await this.applyPendingGatewayAuthIfPresent({
+      instance: launchInstance,
+      userId,
+      gatewayWebSocketUrl: session.gatewayWebSocketUrl,
+      token: session.token,
+      requestMeta,
+    });
+    await this.syncManagedTrustedProxyAllowUserBestEffort({
+      instanceId: launchInstance.id,
+      userId,
+      gatewayWebSocketUrl: session.gatewayWebSocketUrl,
+      token: session.token,
+      reason: "launch",
+    });
 
     const controlUiBase = this.ensureTrailingSlash(
-      this.resolveLaunchBaseUrl(health.instance, "control_ui"),
+      this.resolveLaunchBaseUrl(launchInstance, "control_ui"),
     );
     const gatewayWebSocketUrl = this.withQuery(this.toWebSocketUrl(controlUiBase), {
-      instanceId: health.instance.id,
+      instanceId: launchInstance.id,
       token: session.token,
       mode: "trusted-proxy",
     });
     const launchUrl = this.withQuery(controlUiBase, {
-      instanceId: health.instance.id,
+      instanceId: launchInstance.id,
       token: session.token,
       mode: "trusted-proxy",
       gatewayUrl: gatewayWebSocketUrl,
+      session: DEFAULT_MAIN_SESSION_KEY,
     });
 
-    await this.ensureControlUiLaunchable(health.instance, launchUrl);
+    const gatewayBaseUrl =
+      launchInstance.gateway_url || this.buildGatewayTenantUrl(launchInstance.id);
+    const shouldPreflightLaunch = !launchInstance.provisioned_at;
+    if (shouldPreflightLaunch) {
+      await this.ensureControlUiLaunchable(launchInstance, launchUrl, gatewayBaseUrl);
+    }
+    await this.syncGatewayMainSessionModelBestEffort({
+      instanceId: launchInstance.id,
+      userId,
+      gatewayWebSocketUrl,
+      token: session.token,
+      reason: "launch",
+    });
 
     await this.logEvent(
-      health.instance.id,
+      launchInstance.id,
       userId,
       "session.control_ui",
       "Control UI launch session created",
@@ -1204,7 +1291,7 @@ export class ClawNowService {
     );
 
     return {
-      instance: health.instance,
+      instance: launchInstance,
       launchUrl,
       expiresAt: session.expiresAt,
     };
@@ -1237,6 +1324,7 @@ export class ClawNowService {
       strictControlUiOriginSync: false,
     });
     await this.patchOpenAiProviderAndWorkspaceDefaults({
+      userId,
       gatewayWebSocketUrl: session.gatewayWebSocketUrl,
       token: session.token,
       providerId: "openai",
@@ -1296,6 +1384,7 @@ export class ClawNowService {
       strictControlUiOriginSync: false,
     });
     await this.patchOpenAiProviderAndWorkspaceDefaults({
+      userId,
       gatewayWebSocketUrl: session.gatewayWebSocketUrl,
       token: session.token,
       providerId: "openai-codex",
@@ -1324,45 +1413,106 @@ export class ClawNowService {
     return { instance: health.instance };
   }
 
-  async repairGatewayDefaults(
-    userId: string,
-    requestMeta?: ClawNowRequestMeta,
-  ): Promise<{ instance: ClawInstance; changed: boolean }> {
-    const instance = await this.requireRunningInstance(userId);
-    const session = await this.createControlGatewaySession(instance, userId, requestMeta, {
-      syncControlUiOrigins: true,
-      strictControlUiOriginSync: false,
-    });
-    const changed = await this.applyClawNowGatewayDefaults({
-      gatewayWebSocketUrl: session.gatewayWebSocketUrl,
-      token: session.token,
-      force: true,
-    });
-    if (changed) {
-      // Gateway hot-reload is intentionally disabled during onboarding flows.
-      // After repairing defaults, force a gateway restart so new browser/control-ui
-      // settings (for example browser.noSandbox) take effect immediately.
-      await this.repairGatewayViaProxy({
-        gatewayWebSocketUrl: session.gatewayWebSocketUrl,
-        token: session.token,
-        reason: "gateway-defaults-repair",
-      }).catch(() => false);
+  private async applyPendingGatewayAuthIfPresent(params: {
+    instance: ClawInstance;
+    userId: string;
+    gatewayWebSocketUrl: string;
+    token: string;
+    requestMeta?: ClawNowRequestMeta;
+    source?: string;
+  }): Promise<ClawInstance> {
+    const metadata =
+      params.instance.metadata && typeof params.instance.metadata === "object"
+        ? params.instance.metadata
+        : {};
+    const pending = this.readPendingGatewayAuthState(metadata);
+    if (!pending) {
+      return params.instance;
     }
 
-    await this.logEvent(
-      instance.id,
-      userId,
-      "gateway.defaults.repair",
-      changed
-        ? "Repaired gateway defaults for browser/channel setup"
-        : "Gateway defaults already up to date",
-      {
-        changed,
-        ip: requestMeta?.ip || null,
-      },
-    );
+    try {
+      await this.patchOpenAiProviderAndWorkspaceDefaults({
+        userId: params.userId,
+        gatewayWebSocketUrl: params.gatewayWebSocketUrl,
+        token: params.token,
+        providerId: pending.providerId,
+        apiKey: pending.accessToken,
+        fallbackBaseUrl: OPENAI_CODEX_PROVIDER_DEFAULT_BASE_URL,
+        modelRef: OPENAI_CODEX_DEFAULT_MODEL,
+        alias: "Codex",
+      });
+      await this.patchGatewayMainSessionModel({
+        gatewayWebSocketUrl: params.gatewayWebSocketUrl,
+        token: params.token,
+        modelRef: OPENAI_CODEX_DEFAULT_MODEL,
+      });
 
-    return { instance, changed };
+      const updated = await this.updateInstance(params.instance.id, {
+        metadata: {
+          ...metadata,
+          pending_gateway_auth: null,
+        },
+      });
+
+      await this.logEvent(
+        updated.id,
+        params.userId,
+        "auth.pending.openai_codex_oauth.applied",
+        `Applied pending OpenAI Codex OAuth auth during ${params.source || "launch"}`,
+        {
+          ip: params.requestMeta?.ip || null,
+          tokenPrefix: pending.accessToken.slice(0, 7),
+        },
+      );
+
+      return updated;
+    } catch (error) {
+      await this.logEvent(
+        params.instance.id,
+        params.userId,
+        "auth.pending.openai_codex_oauth.apply_failed",
+        `Failed to apply pending OpenAI Codex OAuth auth during ${params.source || "launch"}: ${safeErrorMessage(error)}`,
+        {
+          error: safeErrorMessage(error),
+        },
+        "warn",
+      );
+      return params.instance;
+    }
+  }
+
+  private async syncPendingGatewayAuthAfterHealthCheck(
+    instance: ClawInstance,
+    userId: string,
+  ): Promise<ClawInstance> {
+    if (
+      instance.status !== "running" ||
+      !instance.provisioned_at ||
+      !this.isTerminalOnboardingCompleted(instance)
+    ) {
+      return instance;
+    }
+    const metadata =
+      instance.metadata && typeof instance.metadata === "object" ? instance.metadata : {};
+    if (!this.readPendingGatewayAuthState(metadata)) {
+      return instance;
+    }
+
+    try {
+      const session = await this.createControlGatewaySession(instance, userId, undefined, {
+        syncControlUiOrigins: false,
+        strictControlUiOriginSync: false,
+      });
+      return await this.applyPendingGatewayAuthIfPresent({
+        instance,
+        userId,
+        gatewayWebSocketUrl: session.gatewayWebSocketUrl,
+        token: session.token,
+        source: "health sync",
+      });
+    } catch {
+      return instance;
+    }
   }
 
   async restartGateway(
@@ -1374,17 +1524,25 @@ export class ClawNowService {
       syncControlUiOrigins: true,
       strictControlUiOriginSync: false,
     });
+    await this.syncManagedTrustedProxyAllowUserBestEffort({
+      instanceId: instance.id,
+      userId,
+      gatewayWebSocketUrl: session.gatewayWebSocketUrl,
+      token: session.token,
+      reason: "gateway restart",
+    });
     let managedUpdaterAttempted = false;
     let managedUpdaterApplied = false;
     if (this.config.controlUiManifestUrl) {
       managedUpdaterAttempted = true;
       const scriptUrls = this.resolveBootstrapScriptUrls();
       try {
-        const updaterResult = await this.updateControlUiViaProxy({
+        const updaterResult = await this.syncWorkspaceReleaseViaProxy({
           gatewayWebSocketUrl: session.gatewayWebSocketUrl,
           token: session.token,
           manifestUrl: this.config.controlUiManifestUrl,
           updaterScriptUrl: scriptUrls.controlUiUpdaterScriptUrl,
+          proxyScriptUrl: scriptUrls.proxyScriptUrl,
         });
         managedUpdaterApplied = updaterResult.updated;
       } catch {
@@ -1395,6 +1553,13 @@ export class ClawNowService {
       gatewayWebSocketUrl: session.gatewayWebSocketUrl,
       token: session.token,
       reason: "manual-gateway-restart",
+    });
+    await this.syncGatewayMainSessionModelBestEffort({
+      instanceId: instance.id,
+      userId,
+      gatewayWebSocketUrl: session.gatewayWebSocketUrl,
+      token: session.token,
+      reason: "gateway restart",
     });
 
     await this.logEvent(
@@ -1416,7 +1581,7 @@ export class ClawNowService {
     return { instance, restarted };
   }
 
-  async updateControlUi(
+  async syncWorkspaceRelease(
     userId: string,
     requestMeta?: ClawNowRequestMeta,
   ): Promise<{ instance: ClawInstance; updated: boolean; message: string }> {
@@ -1428,30 +1593,45 @@ export class ClawNowService {
 
     if (!this.config.controlUiManifestUrl) {
       throw new ClawNowServiceError(
-        "CONTROL_UI_MANIFEST_MISSING",
-        "Control UI manifest URL is not configured on this deployment.",
+        "WORKSPACE_RELEASE_MANIFEST_MISSING",
+        "Workspace release manifest URL is not configured on this deployment.",
         503,
       );
     }
 
     const scriptUrls = this.resolveBootstrapScriptUrls();
-    const result = await this.updateControlUiViaProxy({
+    const result = await this.syncWorkspaceReleaseViaProxy({
       gatewayWebSocketUrl: session.gatewayWebSocketUrl,
       token: session.token,
       manifestUrl: this.config.controlUiManifestUrl,
       updaterScriptUrl: scriptUrls.controlUiUpdaterScriptUrl,
+      proxyScriptUrl: scriptUrls.proxyScriptUrl,
+    });
+    await this.syncManagedTrustedProxyAllowUserBestEffort({
+      instanceId: instance.id,
+      userId,
+      gatewayWebSocketUrl: session.gatewayWebSocketUrl,
+      token: session.token,
+      reason: "workspace release update",
+    });
+    await this.syncGatewayMainSessionModelBestEffort({
+      instanceId: instance.id,
+      userId,
+      gatewayWebSocketUrl: session.gatewayWebSocketUrl,
+      token: session.token,
+      reason: "workspace release update",
     });
     const message = result.updated
-      ? "Workspace UI updated on this VM. Refresh Gateway to load the latest interface."
-      : "Workspace UI is already on the latest version for this VM.";
+      ? "Workspace release updated on this VM. Refresh Gateway to load the latest runtime and interface."
+      : "Workspace release is already on the latest version for this VM.";
 
     await this.logEvent(
       instance.id,
       userId,
-      "control_ui.update",
+      "workspace.release.sync",
       result.updated
-        ? "Updated workspace Control UI package on VM"
-        : "Control UI package already up to date",
+        ? "Updated workspace release on VM"
+        : "Workspace release already up to date",
       {
         updated: result.updated,
         currentRoot: result.currentRoot,
@@ -1462,26 +1642,8 @@ export class ClawNowService {
     return { instance, updated: result.updated, message };
   }
 
-  private async applyClawNowGatewayDefaults(params: {
-    gatewayWebSocketUrl: string;
-    token: string;
-    force: boolean;
-  }): Promise<boolean> {
-    const snapshot = await this.requestGatewayMethod<{ config?: unknown }>(
-      params.gatewayWebSocketUrl,
-      params.token,
-      "config.get",
-      {},
-    );
-    const patch = buildClawNowGatewayDefaultsPatch(snapshot?.config, params.force);
-    if (!patch) {
-      return false;
-    }
-    await this.patchGatewayConfig(params.gatewayWebSocketUrl, params.token, patch);
-    return true;
-  }
-
   private async patchOpenAiProviderAndWorkspaceDefaults(params: {
+    userId: string;
     gatewayWebSocketUrl: string;
     token: string;
     providerId: string;
@@ -1530,6 +1692,11 @@ export class ClawNowService {
     }
 
     const defaultsPatch = buildClawNowGatewayDefaultsPatch(snapshot?.config, false);
+    const trustedProxyAllowUsersPatch = buildClawNowTrustedProxyAllowUsersPatch(
+      snapshot?.config,
+      params.userId,
+      true,
+    );
     const defaultsAgentDefaults = asObjectRecord(asObjectRecord(defaultsPatch?.agents)?.defaults);
     const defaultsMemorySearch = asObjectRecord(defaultsAgentDefaults?.memorySearch);
     const defaultsMemoryRemote = asObjectRecord(defaultsMemorySearch?.remote);
@@ -1566,6 +1733,17 @@ export class ClawNowService {
       };
     }
 
+    const currentDefaultAgentId = resolveDefaultAgentIdFromGatewayConfig(snapshot?.config);
+    const configAgents = asObjectRecord(config?.agents);
+    const configAgentsList = Array.isArray(configAgents?.list) ? configAgents.list : [];
+    const hasExplicitDefaultAgent = configAgentsList.some((entry) => {
+      const record = asObjectRecord(entry);
+      return (
+        typeof record?.id === "string" &&
+        record.id.trim().toLowerCase() === currentDefaultAgentId.toLowerCase()
+      );
+    });
+
     const mergedAgentDefaults: Record<string, unknown> = {
       ...defaultsAgentDefaults,
       model: {
@@ -1583,6 +1761,7 @@ export class ClawNowService {
 
     const mergedPatch: Record<string, unknown> = {
       ...defaultsPatch,
+      ...trustedProxyAllowUsersPatch,
       models: {
         providers: {
           [params.providerId]: providerPatch,
@@ -1590,6 +1769,18 @@ export class ClawNowService {
       },
       agents: {
         defaults: mergedAgentDefaults,
+        ...(hasExplicitDefaultAgent
+          ? {
+              list: [
+                {
+                  id: currentDefaultAgentId,
+                  model: {
+                    primary: modelRef,
+                  },
+                },
+              ],
+            }
+          : {}),
       },
     };
 
@@ -1613,6 +1804,99 @@ export class ClawNowService {
       });
     } catch {
       // Best-effort: keep auth setup successful even if main session wasn't created yet.
+    }
+  }
+
+  private async syncGatewayMainSessionModelFromConfig(params: {
+    gatewayWebSocketUrl: string;
+    token: string;
+  }): Promise<void> {
+    const snapshot = await this.requestGatewayMethod<{ config?: unknown }>(
+      params.gatewayWebSocketUrl,
+      params.token,
+      "config.get",
+      {},
+    );
+    const modelRef = resolveGatewayPrimaryModelRef(snapshot?.config);
+    if (!modelRef) {
+      return;
+    }
+    await this.patchGatewayMainSessionModel({
+      gatewayWebSocketUrl: params.gatewayWebSocketUrl,
+      token: params.token,
+      modelRef,
+    });
+  }
+
+  private async syncGatewayMainSessionModelBestEffort(params: {
+    instanceId: string;
+    userId: string;
+    gatewayWebSocketUrl: string;
+    token: string;
+    reason: string;
+  }): Promise<void> {
+    try {
+      await this.syncGatewayMainSessionModelFromConfig({
+        gatewayWebSocketUrl: params.gatewayWebSocketUrl,
+        token: params.token,
+      });
+    } catch (error) {
+      await this.logEvent(
+        params.instanceId,
+        params.userId,
+        "gateway.main_session_model.sync_failed",
+        `Failed to sync main chat session model during ${params.reason}: ${safeErrorMessage(error)}`,
+        { error: safeErrorMessage(error), reason: params.reason },
+        "warn",
+      );
+    }
+  }
+
+  private async syncManagedTrustedProxyAllowUser(params: {
+    userId: string;
+    gatewayWebSocketUrl: string;
+    token: string;
+    force?: boolean;
+  }): Promise<void> {
+    const snapshot = await this.requestGatewayMethod<{ config?: unknown }>(
+      params.gatewayWebSocketUrl,
+      params.token,
+      "config.get",
+      {},
+    );
+    const patch = buildClawNowTrustedProxyAllowUsersPatch(
+      snapshot?.config,
+      params.userId,
+      params.force !== false,
+    );
+    if (!patch) {
+      return;
+    }
+    await this.patchGatewayConfig(params.gatewayWebSocketUrl, params.token, patch);
+  }
+
+  private async syncManagedTrustedProxyAllowUserBestEffort(params: {
+    instanceId: string;
+    userId: string;
+    gatewayWebSocketUrl: string;
+    token: string;
+    reason: string;
+  }): Promise<void> {
+    try {
+      await this.syncManagedTrustedProxyAllowUser({
+        userId: params.userId,
+        gatewayWebSocketUrl: params.gatewayWebSocketUrl,
+        token: params.token,
+      });
+    } catch (error) {
+      await this.logEvent(
+        params.instanceId,
+        params.userId,
+        "gateway.trusted_proxy_allow_users.sync_failed",
+        `Failed to sync trusted-proxy allowUsers during ${params.reason}: ${safeErrorMessage(error)}`,
+        { error: safeErrorMessage(error), reason: params.reason },
+        "warn",
+      );
     }
   }
 
@@ -1669,6 +1953,40 @@ export class ClawNowService {
       authUrl,
       createdAtMs: createdAtMsRaw,
       ...(accessToken ? { accessToken } : {}),
+    };
+  }
+
+  private readPendingGatewayAuthState(
+    metadata: Record<string, unknown>,
+  ): PendingGatewayAuthState | null {
+    const raw = (metadata as { pending_gateway_auth?: unknown }).pending_gateway_auth;
+    const record = asObjectRecord(raw);
+    if (!record) {
+      return null;
+    }
+    const providerId = typeof record.providerId === "string" ? record.providerId.trim() : "";
+    const accessToken = typeof record.accessToken === "string" ? record.accessToken.trim() : "";
+    const createdAtMsRaw =
+      typeof record.createdAtMs === "number" && Number.isFinite(record.createdAtMs)
+        ? Math.floor(record.createdAtMs)
+        : typeof record.createdAtMs === "string"
+          ? Number(record.createdAtMs)
+          : Number.NaN;
+    if (providerId !== "openai-codex" || !accessToken || !Number.isFinite(createdAtMsRaw)) {
+      return null;
+    }
+    return {
+      providerId: "openai-codex",
+      accessToken,
+      createdAtMs: createdAtMsRaw,
+    };
+  }
+
+  private createPendingGatewayAuthState(accessToken: string): PendingGatewayAuthState {
+    return {
+      providerId: "openai-codex",
+      accessToken: accessToken.trim(),
+      createdAtMs: Date.now(),
     };
   }
 
@@ -1961,22 +2279,7 @@ export class ClawNowService {
       await this.configureGatewayAuthWithWarmupRetry(() =>
         this.configureOpenAiApiKey(userId, apiKey, requestMeta),
       );
-      const doneInstance = await this.updateOnboardingState(instance, {
-        completed: true,
-        status: "done",
-      });
-      // Clear wizard session bookkeeping but keep onboarding_completed=true.
-      const cleared = await this.updateInstance(doneInstance.id, {
-        metadata: {
-          ...(doneInstance.metadata && typeof doneInstance.metadata === "object"
-            ? doneInstance.metadata
-            : {}),
-          onboarding_session_id: null,
-          onboarding_step_id: null,
-          onboarding_codex_session_id: null,
-          onboarding_codex_oauth: null,
-        },
-      });
+      const cleared = await this.finishTerminalOnboarding(instance);
 
       return {
         instance: cleared,
@@ -2046,24 +2349,20 @@ export class ClawNowService {
         });
       }
 
-      await this.configureGatewayAuthWithWarmupRetry(() =>
-        this.configureOpenAiCodexAccessToken(userId, accessToken, requestMeta),
-      );
-      const doneInstance = await this.updateOnboardingState(instance, {
-        completed: true,
-        status: "done",
-      });
-      const cleared = await this.updateInstance(doneInstance.id, {
-        metadata: {
-          ...(doneInstance.metadata && typeof doneInstance.metadata === "object"
-            ? doneInstance.metadata
-            : {}),
-          onboarding_session_id: null,
-          onboarding_step_id: null,
-          onboarding_codex_session_id: null,
-          onboarding_codex_oauth: null,
-        },
-      });
+      let cleared: ClawInstance;
+      try {
+        await this.configureGatewayAuthWithWarmupRetry(() =>
+          this.configureOpenAiCodexAccessToken(userId, accessToken, requestMeta),
+        );
+        cleared = await this.finishTerminalOnboarding(instance);
+      } catch (error) {
+        if (!(error instanceof ClawNowServiceError) || error.code !== "GATEWAY_WARMING_UP") {
+          throw error;
+        }
+        cleared = await this.finishTerminalOnboarding(instance, {
+          pending_gateway_auth: this.createPendingGatewayAuthState(accessToken),
+        });
+      }
 
       return {
         instance: cleared,
@@ -2472,16 +2771,16 @@ export class ClawNowService {
       snapshot?.config?.gateway?.controlUi?.allowedOrigins,
     );
     const mergedOrigins = Array.from(new Set([...existingOrigins, ...requestedOrigins]));
-    const fallbackEnabled =
-      snapshot?.config?.gateway?.controlUi?.dangerouslyAllowHostHeaderOriginFallback === true;
+    const fallbackDisabled =
+      snapshot?.config?.gateway?.controlUi?.dangerouslyAllowHostHeaderOriginFallback === false;
     const originsChanged = !this.sameStringSet(existingOrigins, mergedOrigins);
 
-    if (originsChanged || !fallbackEnabled) {
+    if (originsChanged || !fallbackDisabled) {
       await this.patchGatewayConfig(params.gatewayWebSocketUrl, params.token, {
         gateway: {
           controlUi: {
             allowedOrigins: mergedOrigins,
-            dangerouslyAllowHostHeaderOriginFallback: true,
+            dangerouslyAllowHostHeaderOriginFallback: false,
           },
         },
       });
@@ -2849,16 +3148,17 @@ export class ClawNowService {
     }
   }
 
-  private async updateControlUiViaProxy(params: {
+  private async syncWorkspaceReleaseViaProxy(params: {
     gatewayWebSocketUrl: string;
     token: string;
     manifestUrl: string;
     updaterScriptUrl: string;
+    proxyScriptUrl: string;
   }): Promise<{ updated: boolean; currentRoot: string | null }> {
     const origin = this.toHttpOriginFromWebSocketUrl(params.gatewayWebSocketUrl);
     if (!origin) {
       throw new ClawNowServiceError(
-        "CONTROL_UI_UPDATE_FAILED",
+        "WORKSPACE_RELEASE_SYNC_FAILED",
         "Could not derive gateway origin from websocket URL.",
         502,
       );
@@ -2867,18 +3167,19 @@ export class ClawNowService {
     const controller = new AbortController();
     const timeoutHandle = setTimeout(() => controller.abort(), 40_000);
     try {
-      const url = new URL(`/${CONTROL_UI_REPAIR_PATH}`, origin).toString();
+      const url = new URL(`/${WORKSPACE_RELEASE_SYNC_PATH}`, origin).toString();
       const response = await fetch(url, {
         method: "POST",
         signal: controller.signal,
         headers: {
           authorization: `Bearer ${params.token}`,
           "content-type": "application/json; charset=utf-8",
-          "user-agent": "clawnow-control-plane/control-ui-update",
+          "user-agent": "clawnow-control-plane/workspace-release-sync",
         },
         body: JSON.stringify({
           manifestUrl: params.manifestUrl,
           updaterScriptUrl: params.updaterScriptUrl,
+          proxyScriptUrl: params.proxyScriptUrl,
         }),
       });
 
@@ -2912,16 +3213,20 @@ export class ClawNowService {
             : "";
         if (response.status === 404 || rawCode === "route_not_found") {
           throw new ClawNowServiceError(
-            "CONTROL_UI_UPDATE_UNSUPPORTED",
-            "This VM image does not support one-click UI update yet. Please redeploy the VM once, then retry.",
+            "WORKSPACE_RELEASE_SYNC_UNSUPPORTED",
+            "This VM image does not support one-click workspace release sync yet. Please redeploy the VM once, then retry.",
             409,
           );
         }
         const message =
           typeof payload.error === "string" && payload.error.trim()
             ? payload.error.trim()
-            : `Control UI update failed with HTTP ${response.status}`;
-        throw new ClawNowServiceError("CONTROL_UI_UPDATE_FAILED", message, response.status || 502);
+            : `Workspace release update failed with HTTP ${response.status}`;
+        throw new ClawNowServiceError(
+          "WORKSPACE_RELEASE_SYNC_FAILED",
+          message,
+          response.status || 502,
+        );
       }
 
       const updatedRaw =
@@ -2939,8 +3244,8 @@ export class ClawNowService {
     } catch (error) {
       if (isAbortError(error)) {
         throw new ClawNowServiceError(
-          "CONTROL_UI_UPDATE_TIMEOUT",
-          "Control UI update request timed out while waiting for VM response.",
+          "WORKSPACE_RELEASE_SYNC_TIMEOUT",
+          "Workspace release update request timed out while waiting for VM response.",
           504,
         );
       }
@@ -2948,8 +3253,8 @@ export class ClawNowService {
         throw error;
       }
       throw new ClawNowServiceError(
-        "CONTROL_UI_UPDATE_FAILED",
-        error instanceof Error ? error.message : "Control UI update failed",
+        "WORKSPACE_RELEASE_SYNC_FAILED",
+        error instanceof Error ? error.message : "Workspace release update failed",
         502,
       );
     } finally {
@@ -2998,28 +3303,8 @@ export class ClawNowService {
     try {
       const [health, bootstrap] = await Promise.all([
         fetchJson(`/${GATEWAY_HEALTH_PATH}`),
-        fetchJson("/__clawnow/bootstrap"),
+        fetchJson(`/${GATEWAY_BOOTSTRAP_PATH}`),
       ]);
-
-      const describePayloadError = (payload: unknown): string | null => {
-        if (!payload || typeof payload !== "object") {
-          return null;
-        }
-        const errorRaw = (payload as { error?: unknown }).error;
-        const codeRaw = (payload as { code?: unknown }).code;
-        const error = typeof errorRaw === "string" ? errorRaw.trim() : "";
-        const code = typeof codeRaw === "string" ? codeRaw.trim() : "";
-        if (code && error) {
-          return `${code}: ${error}`;
-        }
-        if (error) {
-          return error;
-        }
-        if (code) {
-          return code;
-        }
-        return null;
-      };
 
       const parts: string[] = [];
       parts.push(`origin=${origin}`);
@@ -3027,31 +3312,20 @@ export class ClawNowService {
       if (bootstrap.timeout) {
         parts.push("bootstrap=timeout");
       } else if (bootstrap.ok) {
-        const phase =
-          bootstrap.payload && typeof bootstrap.payload === "object"
-            ? (bootstrap.payload as { phase?: unknown }).phase
-            : null;
-        const status =
-          bootstrap.payload && typeof bootstrap.payload === "object"
-            ? (bootstrap.payload as { status?: unknown }).status
-            : null;
-        const message =
-          bootstrap.payload && typeof bootstrap.payload === "object"
-            ? (bootstrap.payload as { message?: unknown }).message
-            : null;
-        if (typeof phase === "string" && typeof status === "string") {
-          parts.push(`bootstrap=${phase}/${status}`);
+        const bootstrapState = parseGatewayBootstrapState(bootstrap.payload);
+        if (bootstrapState?.phase && bootstrapState.status) {
+          parts.push(`bootstrap=${bootstrapState.phase}/${bootstrapState.status}`);
         } else {
           parts.push("bootstrap=ok");
         }
-        if (typeof message === "string" && message.trim()) {
-          parts.push(`bootstrapMessage=${message.trim()}`);
+        if (bootstrapState?.message) {
+          parts.push(`bootstrapMessage=${bootstrapState.message}`);
         }
       } else {
         parts.push(
           `bootstrapHttp=${bootstrap.status}${
-            describePayloadError(bootstrap.payload)
-              ? ` (${describePayloadError(bootstrap.payload)})`
+            describeGatewayPayloadError(bootstrap.payload)
+              ? ` (${describeGatewayPayloadError(bootstrap.payload)})`
               : ""
           }`,
         );
@@ -3064,7 +3338,9 @@ export class ClawNowService {
       } else {
         parts.push(
           `healthHttp=${health.status}${
-            describePayloadError(health.payload) ? ` (${describePayloadError(health.payload)})` : ""
+            describeGatewayPayloadError(health.payload)
+              ? ` (${describeGatewayPayloadError(health.payload)})`
+              : ""
           }`,
         );
       }
@@ -3290,6 +3566,28 @@ export class ClawNowService {
     });
   }
 
+  private async finishTerminalOnboarding(
+    instance: ClawInstance,
+    extraMetadata?: Record<string, unknown>,
+  ): Promise<ClawInstance> {
+    const doneInstance = await this.updateOnboardingState(instance, {
+      completed: true,
+      status: "done",
+    });
+    const metadata =
+      doneInstance.metadata && typeof doneInstance.metadata === "object" ? doneInstance.metadata : {};
+    return await this.updateInstance(doneInstance.id, {
+      metadata: {
+        ...metadata,
+        onboarding_session_id: null,
+        onboarding_step_id: null,
+        onboarding_codex_session_id: null,
+        onboarding_codex_oauth: null,
+        ...(extraMetadata || {}),
+      },
+    });
+  }
+
   private withQuery(baseUrl: string, query: Record<string, string>): string {
     const url = new URL(baseUrl);
     Object.entries(query).forEach(([key, value]) => {
@@ -3433,7 +3731,7 @@ export class ClawNowService {
 
     throw new ClawNowServiceError(
       "GATEWAY_WARMING_UP",
-      "ChatGPT login succeeded, but the gateway is still warming up. Click Sync Health, wait 10-20 seconds, then click Submit Step again. No need to login again.",
+      "OpenAI auth is saved, but the gateway is still warming up. Leave this page open a little longer, or try Restart Gateway once.",
       409,
     );
   }
@@ -4213,47 +4511,86 @@ export class ClawNowService {
     }
 
     const healthUrl = joinUrl(gatewayUrl, GATEWAY_HEALTH_PATH);
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), GATEWAY_HEALTH_TIMEOUT_MS);
+    const bootstrapUrl = joinUrl(gatewayUrl, GATEWAY_BOOTSTRAP_PATH);
+
+    const fetchJsonProbe = async (
+      url: string,
+      userAgent: string,
+      timeoutMs: number,
+    ): Promise<{ ok: boolean; status: number; payload: unknown; timeout: boolean }> => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(url, {
+          method: "GET",
+          signal: controller.signal,
+          headers: {
+            "user-agent": userAgent,
+          },
+        });
+        let payload: unknown = null;
+        try {
+          payload = (await response.json()) as unknown;
+        } catch {
+          payload = null;
+        }
+        return { ok: response.ok, status: response.status, payload, timeout: false };
+      } catch (error) {
+        if (isAbortError(error)) {
+          return { ok: false, status: 0, payload: null, timeout: true };
+        }
+        throw error;
+      } finally {
+        clearTimeout(timeout);
+      }
+    };
 
     try {
-      const response = await fetch(healthUrl, {
-        method: "GET",
-        signal: controller.signal,
-        headers: {
-          "user-agent": "clawnow-control-plane/gateway-health-probe",
-        },
-      });
+      const [health, bootstrap] = await Promise.all([
+        fetchJsonProbe(
+          healthUrl,
+          "clawnow-control-plane/gateway-health-probe",
+          GATEWAY_HEALTH_TIMEOUT_MS,
+        ),
+        fetchJsonProbe(
+          bootstrapUrl,
+          "clawnow-control-plane/bootstrap-state-probe",
+          GATEWAY_BOOTSTRAP_TIMEOUT_MS,
+        ),
+      ]);
+      const bootstrapState = bootstrap.ok ? parseGatewayBootstrapState(bootstrap.payload) : null;
+      const bootstrapFailureReason = formatGatewayBootstrapFailureReason(bootstrapState);
 
-      if (!response.ok) {
-        let payload: {
-          error?: string;
-          code?: string;
-          upstream?: {
-            openclaw?: {
-              ok?: unknown;
-              error?: unknown;
-            };
-          };
-        } = {};
-        try {
-          payload = (await response.json()) as {
-            error?: string;
-            code?: string;
-            upstream?: {
-              openclaw?: {
-                ok?: unknown;
-                error?: unknown;
-              };
-            };
-          };
-        } catch {
-          payload = {};
-        }
+      if (!health.ok) {
         const legacyMode = await this.detectLegacyHttpGatewayMode(gatewayUrl);
         if (legacyMode) {
           return { ready: false, reason: LEGACY_HTTP_GATEWAY_REASON };
         }
+        if (bootstrapFailureReason) {
+          return {
+            ready: false,
+            code: "bootstrap_failed",
+            reason: bootstrapFailureReason,
+            bootstrapPhase: bootstrapState?.phase ?? undefined,
+            bootstrapStatus: bootstrapState?.status ?? undefined,
+            bootstrapMessage: bootstrapState?.message ?? undefined,
+          };
+        }
+        const payload =
+          health.payload &&
+          typeof health.payload === "object" &&
+          !Array.isArray(health.payload)
+            ? (health.payload as {
+                error?: string;
+                code?: string;
+                upstream?: {
+                  openclaw?: {
+                    ok?: unknown;
+                    error?: unknown;
+                  };
+                };
+              })
+            : {};
         const openclawUpstream =
           payload.upstream && typeof payload.upstream === "object"
             ? payload.upstream.openclaw
@@ -4281,7 +4618,8 @@ export class ClawNowService {
             openclawUpstreamError,
           };
         }
-        const reason = payload.error?.trim();
+        const reason =
+          typeof payload.error === "string" && payload.error.trim() ? payload.error.trim() : "";
         const upstreamHint = openclawUpstreamError
           ? ` (openclaw upstream: ${openclawUpstreamError})`
           : "";
@@ -4291,20 +4629,39 @@ export class ClawNowService {
           openclawUpstreamReady,
           openclawUpstreamError,
           reason: reason
-            ? `Gateway health returned HTTP ${response.status}: ${reason}${upstreamHint}`
-            : `Gateway health returned HTTP ${response.status}${upstreamHint}`,
+            ? `Gateway health returned HTTP ${health.status}: ${reason}${upstreamHint}`
+            : health.timeout
+              ? "Gateway health probe timed out"
+              : `Gateway health returned HTTP ${health.status}${upstreamHint}`,
+          bootstrapPhase: bootstrapState?.phase ?? undefined,
+          bootstrapStatus: bootstrapState?.status ?? undefined,
+          bootstrapMessage: bootstrapState?.message ?? undefined,
         };
       }
 
-      let payload: { success?: boolean } = {};
-      try {
-        payload = (await response.json()) as { success?: boolean };
-      } catch {
-        payload = {};
-      }
+      const payload =
+        health.payload && typeof health.payload === "object" && !Array.isArray(health.payload)
+          ? (health.payload as { success?: boolean })
+          : {};
 
       if (payload.success === false) {
-        return { ready: false, reason: "Gateway health payload is not ready" };
+        if (bootstrapFailureReason) {
+          return {
+            ready: false,
+            code: "bootstrap_failed",
+            reason: bootstrapFailureReason,
+            bootstrapPhase: bootstrapState?.phase ?? undefined,
+            bootstrapStatus: bootstrapState?.status ?? undefined,
+            bootstrapMessage: bootstrapState?.message ?? undefined,
+          };
+        }
+        return {
+          ready: false,
+          reason: "Gateway health payload is not ready",
+          bootstrapPhase: bootstrapState?.phase ?? undefined,
+          bootstrapStatus: bootstrapState?.status ?? undefined,
+          bootstrapMessage: bootstrapState?.message ?? undefined,
+        };
       }
 
       return { ready: true };
@@ -4317,8 +4674,6 @@ export class ClawNowService {
         return { ready: false, reason: LEGACY_HTTP_GATEWAY_REASON };
       }
       return { ready: false, reason: safeErrorMessage(error) };
-    } finally {
-      clearTimeout(timeout);
     }
   }
 
@@ -4458,9 +4813,42 @@ export class ClawNowService {
     }
   }
 
+  private async allowOptimisticControlUiLaunch(
+    instance: ClawInstance,
+    launchUrl: string,
+    gatewayBaseUrl: string | null,
+    cause: string,
+  ): Promise<boolean> {
+    if (!gatewayBaseUrl) {
+      return false;
+    }
+
+    const probe = await this.probeGatewayReadiness(gatewayBaseUrl);
+    if (!probe.ready) {
+      return false;
+    }
+
+    await this.logEvent(
+      instance.id,
+      instance.user_id,
+      "gateway.launch.probe.softened",
+      "Control UI launch preflight failed, but gateway health is ready; continuing with optimistic launch.",
+      {
+        launchUrl,
+        gatewayBaseUrl,
+        cause,
+        readinessCode: probe.code ?? null,
+        readinessReason: probe.reason ?? null,
+      },
+      "warn",
+    );
+    return true;
+  }
+
   private async ensureControlUiLaunchable(
     instance: ClawInstance,
     launchUrl: string,
+    gatewayBaseUrl: string | null,
   ): Promise<void> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), GATEWAY_LAUNCH_PROBE_TIMEOUT_MS);
@@ -4494,6 +4882,16 @@ export class ClawNowService {
         payload.error?.includes("ECONNREFUSED") === true;
 
       if (isUpstreamBootingError) {
+        if (
+          await this.allowOptimisticControlUiLaunch(
+            instance,
+            launchUrl,
+            gatewayBaseUrl,
+            `http-${response.status}:${payload.code || "unknown"}`,
+          )
+        ) {
+          return;
+        }
         await this.updateInstance(instance.id, {
           status: "provisioning",
           last_error: "OpenClaw services are still booting on your VM. Please retry shortly.",
@@ -4526,6 +4924,17 @@ export class ClawNowService {
           { launchUrl },
           "warn",
         );
+        return;
+      }
+
+      if (
+        await this.allowOptimisticControlUiLaunch(
+          instance,
+          launchUrl,
+          gatewayBaseUrl,
+          safeErrorMessage(error),
+        )
+      ) {
         return;
       }
 
@@ -4564,7 +4973,7 @@ export class ClawNowService {
       rendered = this.buildCompactBootstrapCloudInit(bootstrapCommandRaw, userId, instanceId);
     } else {
       rendered = this.buildCompactBootstrapCloudInit(
-        this.buildDefaultBootstrapCommand(instanceId),
+        this.buildDefaultBootstrapCommand(userId, instanceId),
         userId,
         instanceId,
       );
@@ -4597,7 +5006,7 @@ runcmd:
 `;
   }
 
-  private buildDefaultBootstrapCommand(instanceId: string): string {
+  private buildDefaultBootstrapCommand(userId: string, instanceId: string): string {
     const { bootstrapScriptUrl, proxyScriptUrl, controlUiUpdaterScriptUrl } =
       this.resolveBootstrapScriptUrls();
     const controlPrefix = `/${this.config.controlUiPath}`;
@@ -4628,6 +5037,7 @@ runcmd:
       `--control-prefix '${controlPrefix}'`,
       `--novnc-prefix '${noVncPrefix}'`,
       `--instance-id '${instanceId}'`,
+      `--trusted-proxy-user '${userId}'`,
       `--gateway-origin-template '${this.config.instanceGatewayTemplate}'`,
       `--control-plane-device-id '${this.gatewayDeviceIdentity.deviceId}'`,
       `--control-plane-device-public-key '${this.gatewayDeviceIdentity.publicKeyBase64Url}'`,
@@ -4640,10 +5050,14 @@ runcmd:
             `--control-ui-manifest-url '${this.config.controlUiManifestUrl}'`,
             `--control-ui-updater-script-url '${controlUiUpdaterScriptUrlWithBust}'`,
           ]
-        : []),
-      ...(this.config.openClawVersion
-        ? [`--openclaw-version '${this.config.openClawVersion}'`]
-        : []),
+        : [
+            ...(this.config.openClawVersion
+              ? [`--openclaw-version '${this.config.openClawVersion}'`]
+              : []),
+            ...(this.config.openClawInstallSpec
+              ? [`--openclaw-install-spec '${this.config.openClawInstallSpec}'`]
+              : []),
+          ]),
       ...(usePublicHttpGateway ? ["--disable-https"] : []),
     ].join(" ");
   }

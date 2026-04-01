@@ -29,6 +29,31 @@ pnpm dev
 
 The app runs at `http://localhost:3333` and serves `/clawnow`.
 
+## Railway Deploy
+
+Use the checked-in staging flow instead of raw `railway up .`.
+
+```bash
+cd clawnow-control-plane
+npm run lock:check
+npm run deploy:railway
+```
+
+This flow does three things on purpose:
+
+- validates that `package-lock.json` is a standalone npm lockfile, not a pnpm-workspace link snapshot
+- stages a temporary deploy directory with only the active bootstrap assets referenced by `public/bootstrap/control-ui-manifest.json`
+- uploads that staged directory with `railway up --path-as-root`
+
+Optional follow-up smoke check:
+
+```bash
+cd clawnow-control-plane
+npm run smoke:control-plane -- --base-url https://claw-now.app
+```
+
+This deploy path intentionally stages a slim bundle and relies on Railway's npm/Next build flow, which we have verified against this package.
+
 ## Included
 
 - Onboarding-first page (`Deploy your first 🦞`):
@@ -54,7 +79,7 @@ This scaffold expects a Next.js/Supabase control-plane app environment with:
 
 By default, VM cloud-init auto-runs this script for 24/7 startup:
 
-- `https://raw.githubusercontent.com/openclaw/openclaw/main/scripts/clawnow-vm-bootstrap.sh`
+- `https://raw.githubusercontent.com/cayden970207/clawnow/main/clawnow-control-plane/scripts/clawnow-vm-bootstrap.sh`
 
 If you need a custom startup sequence, set `CLAWNOW_OPENCLAW_BOOTSTRAP_COMMAND`.
 
@@ -86,5 +111,5 @@ CLAWNOW_PROVISIONING_TIMEOUT_SECONDS=900
 CLAWNOW_HETZNER_CLOUD_INIT=
 CLAWNOW_OPENCLAW_BOOTSTRAP_COMMAND=
 # Example using template placeholders:
-# CLAWNOW_OPENCLAW_BOOTSTRAP_COMMAND=curl -fsSL https://raw.githubusercontent.com/openclaw/openclaw/main/scripts/clawnow-vm-bootstrap.sh | bash -s -- --proxy-secret '{{PROXY_SHARED_SECRET}}' --control-prefix '/{{CONTROL_UI_PATH}}' --novnc-prefix '/{{NOVNC_PATH}}'
+# CLAWNOW_OPENCLAW_BOOTSTRAP_COMMAND=curl -fsSL https://raw.githubusercontent.com/cayden970207/clawnow/main/clawnow-control-plane/scripts/clawnow-vm-bootstrap.sh | bash -s -- --proxy-secret '{{PROXY_SHARED_SECRET}}' --control-prefix '/{{CONTROL_UI_PATH}}' --novnc-prefix '/{{NOVNC_PATH}}'
 ```

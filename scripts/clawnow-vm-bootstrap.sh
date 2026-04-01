@@ -29,12 +29,12 @@ Optional:
   --openclaw-version <ver>     npm package version (default: 2026.3.28)
   --openclaw-install-spec <s>  npm install spec or URL (overrides --openclaw-version)
   --proxy-script-url <url>     Proxy script URL
-                               (default: https://raw.githubusercontent.com/openclaw/openclaw/main/clawnow-control-plane/scripts/clawnow-proxy.mjs)
+                               (default: https://raw.githubusercontent.com/cayden970207/clawnow/main/clawnow-control-plane/scripts/clawnow-proxy.mjs)
   --control-ui-manifest-url <url>
                                Optional Control UI manifest URL for automatic UI updates
   --control-ui-updater-script-url <url>
                                Control UI updater script URL
-                               (default: https://raw.githubusercontent.com/openclaw/openclaw/main/clawnow-control-plane/scripts/clawnow-control-ui-updater.sh)
+                               (default: https://raw.githubusercontent.com/cayden970207/clawnow/main/clawnow-control-plane/scripts/clawnow-control-ui-updater.sh)
 
 Logs:
   /var/log/clawnow-bootstrap.log
@@ -58,9 +58,9 @@ CONTROL_UI_ORIGIN=""
 ENABLE_HTTPS="1"
 OPENCLAW_VERSION="2026.3.28"
 OPENCLAW_INSTALL_SPEC=""
-PROXY_SCRIPT_URL="https://raw.githubusercontent.com/openclaw/openclaw/main/clawnow-control-plane/scripts/clawnow-proxy.mjs"
+PROXY_SCRIPT_URL="https://raw.githubusercontent.com/cayden970207/clawnow/main/clawnow-control-plane/scripts/clawnow-proxy.mjs"
 CONTROL_UI_MANIFEST_URL=""
-CONTROL_UI_UPDATER_SCRIPT_URL="https://raw.githubusercontent.com/openclaw/openclaw/main/clawnow-control-plane/scripts/clawnow-control-ui-updater.sh"
+CONTROL_UI_UPDATER_SCRIPT_URL="https://raw.githubusercontent.com/cayden970207/clawnow/main/clawnow-control-plane/scripts/clawnow-control-ui-updater.sh"
 CONTROL_UI_ROOT=""
 CONTROL_PLANE_DEVICE_ID=""
 CONTROL_PLANE_DEVICE_PUBLIC_KEY=""
