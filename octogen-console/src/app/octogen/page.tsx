@@ -1,0 +1,2210 @@
+"use client";
+
+import { ArrowLeft, ExternalLink, Loader2, RefreshCw, Server, Wrench } from "lucide-react";
+import { useRouter } from "next/navigation";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { AuthModal } from "@/components/AuthModal";
+import { useAuth } from "@/contexts/authContext";
+
+type OctogenVmStatus =
+  | "provisioning"
+  | "running"
+  | "recovering"
+  | "stopped"
+  | "error"
+  | "deleting"
+  | "terminated";
+
+type OnboardingWizardStatus = "running" | "done" | "cancelled" | "error";
+type OnboardingStepType =
+  | "note"
+  | "select"
+  | "text"
+  | "confirm"
+  | "multiselect"
+  | "progress"
+  | "action";
+type WorkspaceStage = "deploy" | "booting" | "wizard" | "gateway";
+
+interface OctogenVm {
+  id: string;
+  status: OctogenVmStatus;
+  hetzner_server_id: number | null;
+  region: string;
+  server_type: string;
+  image: string;
+  server_name: string;
+  ipv4: string | null;
+  ipv6: string | null;
+  provisioned_at: string | null;
+  updated_at: string;
+  last_error: string | null;
+  metadata?: Record<string, unknown>;
+}
+
+interface WorkspaceBillingSummary {
+  status: "ok" | "unavailable";
+  currency: "USD";
+  organizationMembershipCount: number;
+  organizationSubscriptionCount: number;
+  organizationPrepaidBalance: number;
+  selectedOrganizationId: string | null;
+  selectedOrganizationName: string | null;
+  selectedOrganizationPrepaidBalance: number | null;
+  organizations: WorkspaceBillingOrganization[];
+  message?: string;
+}
+
+interface WorkspaceBillingOrganization {
+  id: string;
+  name: string;
+  slug: string | null;
+  prepaidBalance: number;
+  hasActiveSubscription: boolean;
+}
+
+type OctogenAgentStatus =
+  | "draft"
+  | "provisioning"
+  | "runtime_ready"
+  | "needs_provider"
+  | "provider_configuring"
+  | "provider_verifying"
+  | "provider_error"
+  | "needs_test_chat"
+  | "test_chat_running"
+  | "test_chat_failed"
+  | "needs_channel"
+  | "channel_connecting"
+  | "channel_error"
+  | "ready"
+  | "degraded"
+  | "stopped"
+  | "error"
+  | "archived";
+
+interface OctogenAgentProvider {
+  id: string;
+  provider_id: string;
+  status: string;
+  model_id: string | null;
+}
+
+interface OctogenAgentChannel {
+  id: string;
+  channel: string;
+  status: string;
+  display_name: string | null;
+  identity?: Record<string, unknown>;
+}
+
+interface OctogenAgent {
+  id: string;
+  name: string;
+  status: OctogenAgentStatus;
+  runtime_kind: "hermes";
+  vm_id: string | null;
+  hermes_profile_id: string | null;
+  current_observed_task: string | null;
+  last_seen_at: string | null;
+  last_error: string | null;
+  metadata?: Record<string, unknown>;
+  providers?: OctogenAgentProvider[];
+  channels?: OctogenAgentChannel[];
+}
+
+interface OctogenAgentWorkspaceSummary {
+  status: "ok" | "unavailable";
+  totalAgents: number;
+  readyAgents: number;
+  runtimeReadyAgents: number;
+  runtimeProvisioningAgents: number;
+  needsProviderAgents: number;
+  needsChannelAgents: number;
+  connectedChannels: number;
+  missingProviders: number;
+  runningTasks: number;
+  latestAgent: OctogenAgent | null;
+  message?: string;
+}
+
+interface OnboardingWizardStepOption {
+  value: unknown;
+  label: string;
+  hint?: string;
+}
+
+interface OnboardingWizardStep {
+  id: string;
+  type: OnboardingStepType;
+  title?: string;
+  message?: string;
+  options?: OnboardingWizardStepOption[];
+  initialValue?: unknown;
+  placeholder?: string;
+  sensitive?: boolean;
+  executor?: "gateway" | "client";
+}
+
+interface OnboardingWizardResult {
+  done: boolean;
+  step?: OnboardingWizardStep;
+  status?: OnboardingWizardStatus;
+  error?: string;
+}
+
+const POLLING_STATUSES = new Set<OctogenVmStatus>(["provisioning", "recovering"]);
+const OCTOGEN_LOADING_LINES = [
+  "Preparing your OpenClaw workspace.",
+  "Provisioning secure gateway and trusted-proxy channels.",
+  "Cloud control loop is warming up - steady.",
+  "If this takes a moment, it is compiling your first stable session.",
+  "OCTOGEN CONSOLE is warming up your agent workspace.",
+  "Running a sanity check: no loose tentacles left behind.",
+  "Warming the browser automation pipeline.",
+  "Your workspace is almost ready, holding steady.",
+] as const;
+const DEFAULT_BOOTING_NOTICE = "OpenClaw is warming up. First boot can take around 3-10 minutes.";
+const OPENCLAW_BROWSER_DOC_URL = "https://docs.openclaw.ai/tools/browser";
+
+class ApiError extends Error {
+  code: string;
+  status: number;
+
+  constructor(message: string, code = "REQUEST_FAILED", status = 500) {
+    super(message);
+    this.name = "ApiError";
+    this.code = code;
+    this.status = status;
+  }
+}
+
+function getStatusLabel(status?: OctogenVmStatus): string {
+  if (!status) {
+    return "Not Provisioned";
+  }
+  if (status === "running") {
+    return "Ready";
+  }
+  if (status === "provisioning") {
+    return "Starting";
+  }
+  if (status === "recovering") {
+    return "Recovering";
+  }
+  if (status === "stopped") {
+    return "Stopped";
+  }
+  if (status === "deleting") {
+    return "Deleting";
+  }
+  if (status === "terminated") {
+    return "Terminated";
+  }
+  return "Error";
+}
+
+function getStatusClass(status?: OctogenVmStatus): string {
+  if (status === "running") {
+    return "bg-[#E8F5E9] text-[#0B7A2A] border-[#CDEAD3]";
+  }
+  if (status === "provisioning" || status === "recovering") {
+    return "bg-[#FFF8E1] text-[#8A6400] border-[#F3E4B4]";
+  }
+  if (status === "error" || status === "stopped") {
+    return "bg-[#FDECEC] text-[#B3261E] border-[#F6CACA]";
+  }
+  return "bg-[#F5F5F5] text-[#666] border-[#E7E7E7]";
+}
+
+function getAgentStatusLabel(status?: OctogenAgentStatus): string {
+  if (!status) {
+    return "Unknown";
+  }
+  const labels: Record<OctogenAgentStatus, string> = {
+    draft: "Draft",
+    provisioning: "Provisioning",
+    runtime_ready: "Runtime Ready",
+    needs_provider: "Needs Provider",
+    provider_configuring: "Provider Configuring",
+    provider_verifying: "Provider Verifying",
+    provider_error: "Provider Error",
+    needs_test_chat: "Needs Test Chat",
+    test_chat_running: "Test Chat Running",
+    test_chat_failed: "Test Chat Failed",
+    needs_channel: "Needs Channel",
+    channel_connecting: "Channel Connecting",
+    channel_error: "Channel Error",
+    ready: "Ready",
+    degraded: "Degraded",
+    stopped: "Stopped",
+    error: "Error",
+    archived: "Archived",
+  };
+  return labels[status] || status;
+}
+
+function getAgentStatusClass(status?: OctogenAgentStatus): string {
+  if (status === "ready") {
+    return "border-[#DCEFD9] bg-[#F6FFF4] text-[#0B7A2A]";
+  }
+  if (status === "error" || status === "provider_error" || status === "channel_error") {
+    return "border-[#F1D1D1] bg-[#FFF6F6] text-[#9D1B1B]";
+  }
+  if (status === "needs_provider" || status === "needs_channel" || status === "needs_test_chat") {
+    return "border-[#EFE3C2] bg-[#FFFBEF] text-[#8A5A00]";
+  }
+  return "border-[#EAEAEA] bg-white text-[#555]";
+}
+
+function hasQueuedRuntimeProvision(agent: OctogenAgent): boolean {
+  const metadata = agent.metadata && typeof agent.metadata === "object" ? agent.metadata : {};
+  const runtimeProvisioning = metadata.runtime_provisioning;
+  if (!runtimeProvisioning || typeof runtimeProvisioning !== "object") {
+    return false;
+  }
+  const actionId = (runtimeProvisioning as { action_id?: unknown }).action_id;
+  return typeof actionId === "string" && actionId.trim().length > 0;
+}
+
+function shouldShowRuntimeProvisionAction(agent: OctogenAgent): boolean {
+  if (hasQueuedRuntimeProvision(agent)) {
+    return true;
+  }
+  return ["draft", "provisioning", "stopped", "error"].includes(agent.status);
+}
+
+function getAgentRuntimeSummary(agent: OctogenAgent): string {
+  if (hasQueuedRuntimeProvision(agent)) {
+    return "queued for VM-side Hermes runner";
+  }
+  if (
+    [
+      "runtime_ready",
+      "needs_provider",
+      "needs_test_chat",
+      "needs_channel",
+      "ready",
+      "degraded",
+    ].includes(agent.status)
+  ) {
+    return "reported ready by Hermes runtime";
+  }
+  if (agent.status === "error" || agent.status === "stopped") {
+    return "needs attention before retry";
+  }
+  return "waiting for provision action";
+}
+
+function formatCurrencyUsd(value: number): string {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(value);
+}
+
+function isOnboardingStepType(value: unknown): value is OnboardingStepType {
+  return (
+    value === "note" ||
+    value === "select" ||
+    value === "text" ||
+    value === "confirm" ||
+    value === "multiselect" ||
+    value === "progress" ||
+    value === "action"
+  );
+}
+
+function isOnboardingStatus(value: unknown): value is OnboardingWizardStatus {
+  return value === "running" || value === "done" || value === "cancelled" || value === "error";
+}
+
+function normalizeWizardResult(raw: unknown): OnboardingWizardResult {
+  if (!raw || typeof raw !== "object") {
+    return {
+      done: true,
+      status: "error",
+      error: "Invalid onboarding response",
+    };
+  }
+  const payload = raw as {
+    done?: unknown;
+    status?: unknown;
+    error?: unknown;
+    step?: unknown;
+  };
+  const done = typeof payload.done === "boolean" ? payload.done : false;
+  const normalized: OnboardingWizardResult = { done };
+
+  if (isOnboardingStatus(payload.status)) {
+    normalized.status = payload.status;
+  }
+  if (typeof payload.error === "string" && payload.error.trim()) {
+    normalized.error = payload.error;
+  }
+
+  const stepRaw = payload.step;
+  if (!stepRaw || typeof stepRaw !== "object") {
+    return normalized;
+  }
+
+  const stepPayload = stepRaw as {
+    id?: unknown;
+    type?: unknown;
+    title?: unknown;
+    message?: unknown;
+    options?: unknown;
+    initialValue?: unknown;
+    placeholder?: unknown;
+    sensitive?: unknown;
+    executor?: unknown;
+  };
+  const stepId = typeof stepPayload.id === "string" ? stepPayload.id.trim() : "";
+  if (!stepId || !isOnboardingStepType(stepPayload.type)) {
+    return normalized;
+  }
+
+  const options = Array.isArray(stepPayload.options)
+    ? stepPayload.options
+        .map((option) => {
+          if (!option || typeof option !== "object") {
+            return null;
+          }
+          const optionPayload = option as { label?: unknown; hint?: unknown; value?: unknown };
+          if (typeof optionPayload.label !== "string" || !optionPayload.label.trim()) {
+            return null;
+          }
+          return {
+            value: optionPayload.value,
+            label: optionPayload.label,
+            ...(typeof optionPayload.hint === "string" && optionPayload.hint.trim()
+              ? {
+                  hint: optionPayload.hint,
+                }
+              : {}),
+          } satisfies OnboardingWizardStepOption;
+        })
+        .filter((option): option is OnboardingWizardStepOption => option !== null)
+    : undefined;
+
+  normalized.step = {
+    id: stepId,
+    type: stepPayload.type,
+    ...(typeof stepPayload.title === "string" ? { title: stepPayload.title } : {}),
+    ...(typeof stepPayload.message === "string" ? { message: stepPayload.message } : {}),
+    ...(options && options.length > 0 ? { options } : {}),
+    ...(stepPayload.initialValue !== undefined ? { initialValue: stepPayload.initialValue } : {}),
+    ...(typeof stepPayload.placeholder === "string"
+      ? { placeholder: stepPayload.placeholder }
+      : {}),
+    ...(typeof stepPayload.sensitive === "boolean" ? { sensitive: stepPayload.sensitive } : {}),
+    ...(stepPayload.executor === "gateway" || stepPayload.executor === "client"
+      ? {
+          executor: stepPayload.executor,
+        }
+      : {}),
+  };
+
+  return normalized;
+}
+
+function deriveInitialStepValue(step: OnboardingWizardStep): unknown {
+  if (step.type === "text") {
+    if (typeof step.initialValue === "string") {
+      return step.initialValue;
+    }
+    if (typeof step.initialValue === "number" || typeof step.initialValue === "boolean") {
+      return String(step.initialValue);
+    }
+    return "";
+  }
+  if (step.type === "confirm") {
+    return Boolean(step.initialValue);
+  }
+  if (step.type === "multiselect") {
+    return Array.isArray(step.initialValue) ? [...step.initialValue] : [];
+  }
+  if (step.type === "select") {
+    if (step.initialValue !== undefined) {
+      return step.initialValue;
+    }
+    return step.options?.[0]?.value;
+  }
+  return null;
+}
+
+function stepRequiresAnswer(step: OnboardingWizardStep): boolean {
+  return (
+    step.type === "select" ||
+    step.type === "text" ||
+    step.type === "confirm" ||
+    step.type === "multiselect"
+  );
+}
+
+const ONBOARDING_GATEWAY_WARMUP_RETRY_WINDOW_MS = 45_000;
+const ONBOARDING_GATEWAY_WARMUP_RETRY_DELAY_MS = 2_500;
+
+function isGatewayHandshakeError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  return /invalid handshake|first request must be connect/i.test(error.message);
+}
+
+function isGatewayWebSocketOpenError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  return /gateway websocket failed to open/i.test(error.message);
+}
+
+function isGatewayWarmupError(error: unknown): boolean {
+  return error instanceof ApiError && error.code === "GATEWAY_WARMING_UP";
+}
+
+function isRedirectUrlInputStep(step: OnboardingWizardStep | null): boolean {
+  if (!step || step.type !== "text") {
+    return false;
+  }
+  const combined =
+    `${step.title || ""} ${step.message || ""} ${step.placeholder || ""}`.toLowerCase();
+  return combined.includes("redirect url");
+}
+
+function isValueSelected(list: unknown[], value: unknown): boolean {
+  return list.some((item) => Object.is(item, value));
+}
+
+function isVmOnboardingComplete(vm: OctogenVm | null): boolean {
+  if (!vm) {
+    return false;
+  }
+  const metadata = vm.metadata && typeof vm.metadata === "object" ? vm.metadata : {};
+  const directCompleted = (metadata as { onboarding_completed?: unknown }).onboarding_completed;
+  if (typeof directCompleted === "boolean") {
+    return directCompleted;
+  }
+  const completedAt = (metadata as { onboarding_completed_at?: unknown }).onboarding_completed_at;
+  return typeof completedAt === "string" && completedAt.trim().length > 0;
+}
+
+async function parseApiResponse<T>(response: Response): Promise<T> {
+  const json = await response.json().catch(() => ({}));
+  if (!response.ok || !json.success) {
+    const message = typeof json.error === "string" ? json.error : "Request failed";
+    const code = typeof json.errorCode === "string" ? json.errorCode : "REQUEST_FAILED";
+    throw new ApiError(message, code, response.status);
+  }
+  return json as T;
+}
+
+export default function OctogenPage() {
+  const router = useRouter();
+  const { user, isLoading: isAuthLoading, getAuthHeaders } = useAuth();
+
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+  const [vm, setVm] = useState<OctogenVm | null>(null);
+  const [agents, setAgents] = useState<OctogenAgent[]>([]);
+  const [agentSummary, setAgentSummary] = useState<OctogenAgentWorkspaceSummary | null>(null);
+  const [billing, setBilling] = useState<WorkspaceBillingSummary | null>(null);
+  const [selectedOrganizationId, setSelectedOrganizationId] = useState<string>("all");
+  const [error, setError] = useState<string | null>(null);
+  const [orgAccessRequired, setOrgAccessRequired] = useState(false);
+
+  const [hasLoaded, setHasLoaded] = useState(false);
+  const [provisioning, setProvisioning] = useState(false);
+  const [recovering, setRecovering] = useState(false);
+  const [restartingGateway, setRestartingGateway] = useState(false);
+  const [updatingControlUi, setUpdatingControlUi] = useState(false);
+  const [openingControlUi, setOpeningControlUi] = useState(false);
+  const [refreshingHealth, setRefreshingHealth] = useState(false);
+  const [creatingAgent, setCreatingAgent] = useState(false);
+  const [provisioningRuntimeAgentId, setProvisioningRuntimeAgentId] = useState<string | null>(null);
+  const [loadingMessageIndex, setLoadingMessageIndex] = useState(0);
+
+  const [onboardingBusy, setOnboardingBusy] = useState(false);
+  const [onboardingAutoFinishing, setOnboardingAutoFinishing] = useState(false);
+  const [onboardingSessionId, setOnboardingSessionId] = useState<string | null>(null);
+  const [onboardingStep, setOnboardingStep] = useState<OnboardingWizardStep | null>(null);
+  const [onboardingStepValue, setOnboardingStepValue] = useState<unknown>(null);
+  const [onboardingStatus, setOnboardingStatus] = useState<OnboardingWizardStatus | null>(null);
+  const [onboardingError, setOnboardingError] = useState<string | null>(null);
+  const [onboardingMessage, setOnboardingMessage] = useState<string | null>(null);
+  const [onboardingOAuthUrl, setOnboardingOAuthUrl] = useState<string | null>(null);
+  const [onboardingOAuthBusy, setOnboardingOAuthBusy] = useState(false);
+  const [manualWizardMode, setManualWizardMode] = useState(false);
+  const activeWorkspaceId = selectedOrganizationId !== "all" ? selectedOrganizationId : null;
+
+  const getOctogenRequestHeaders = useCallback(
+    async (extraHeaders?: Record<string, string>) => {
+      const headers: Record<string, string> = {
+        ...(await getAuthHeaders()),
+        ...extraHeaders,
+      };
+      if (activeWorkspaceId) {
+        headers["x-octogen-workspace-id"] = activeWorkspaceId;
+      }
+      return headers;
+    },
+    [activeWorkspaceId, getAuthHeaders],
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const query = new URLSearchParams(window.location.search);
+    const queryWorkspaceId = query.get("workspaceId") || query.get("orgId");
+    if (queryWorkspaceId && queryWorkspaceId.trim()) {
+      setSelectedOrganizationId(queryWorkspaceId.trim());
+    }
+  }, []);
+
+  const loadCurrent = useCallback(async () => {
+    if (!user) {
+      return;
+    }
+    setError(null);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    try {
+      const headers = await getOctogenRequestHeaders();
+      const endpoint =
+        selectedOrganizationId !== "all"
+          ? `/api/octogen/vms/current?workspaceId=${encodeURIComponent(selectedOrganizationId)}`
+          : "/api/octogen/vms/current";
+      const response = await fetch(endpoint, {
+        headers,
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      const data = await parseApiResponse<{
+        vm: OctogenVm | null;
+        billing?: WorkspaceBillingSummary;
+      }>(response);
+      setVm(data.vm);
+      setBilling(data.billing || null);
+      setOrgAccessRequired(false);
+    } catch (err: unknown) {
+      if (err instanceof ApiError && err.code === "ORG_MEMBERSHIP_REQUIRED") {
+        setOrgAccessRequired(true);
+        setVm(null);
+        setAgents([]);
+        setAgentSummary(null);
+        setBilling(null);
+        setError(err.message);
+        return;
+      }
+      const isTimeout = err instanceof DOMException && err.name === "AbortError";
+      setError(
+        isTimeout
+          ? "Workspace loading timed out. Please refresh or try again in a moment."
+          : err instanceof Error
+            ? err.message
+            : "Failed to load workspace",
+      );
+    } finally {
+      clearTimeout(timeout);
+      setHasLoaded(true);
+    }
+  }, [getOctogenRequestHeaders, selectedOrganizationId, user]);
+
+  const updateOrganizationFilter = useCallback((nextOrganizationId: string) => {
+    setSelectedOrganizationId(nextOrganizationId);
+    if (typeof window === "undefined") {
+      return;
+    }
+    const url = new URL(window.location.href);
+    if (nextOrganizationId === "all") {
+      url.searchParams.delete("workspaceId");
+      url.searchParams.delete("orgId");
+    } else {
+      url.searchParams.set("workspaceId", nextOrganizationId);
+      url.searchParams.delete("orgId");
+    }
+    window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+  }, []);
+
+  const loadAgents = useCallback(async () => {
+    if (!user) {
+      return;
+    }
+    try {
+      const headers = await getOctogenRequestHeaders();
+      const response = await fetch("/api/octogen/agents", {
+        method: "GET",
+        headers,
+        cache: "no-store",
+      });
+      const data = await parseApiResponse<{
+        agents: OctogenAgent[];
+        summary: OctogenAgentWorkspaceSummary;
+      }>(response);
+      setAgents(data.agents);
+      setAgentSummary(data.summary);
+    } catch (err: unknown) {
+      if (err instanceof ApiError && err.code === "WORKSPACE_REQUIRED") {
+        setAgents([]);
+        setAgentSummary(null);
+        return;
+      }
+      setAgentSummary({
+        status: "unavailable",
+        totalAgents: 0,
+        readyAgents: 0,
+        runtimeReadyAgents: 0,
+        runtimeProvisioningAgents: 0,
+        needsProviderAgents: 0,
+        needsChannelAgents: 0,
+        connectedChannels: 0,
+        missingProviders: 0,
+        runningTasks: 0,
+        latestAgent: null,
+        message: err instanceof Error ? err.message : "Agent data is temporarily unavailable.",
+      });
+    }
+  }, [getOctogenRequestHeaders, user]);
+
+  useEffect(() => {
+    if (!billing || billing.status !== "ok") {
+      return;
+    }
+    if (selectedOrganizationId === "all") {
+      const firstWorkspace = billing.organizations[0];
+      if (firstWorkspace) {
+        updateOrganizationFilter(firstWorkspace.id);
+      }
+      return;
+    }
+    if (billing.selectedOrganizationId) {
+      return;
+    }
+    // Keep URL and client filter in sync when requested workspace is no longer valid.
+    updateOrganizationFilter(billing.organizations[0]?.id || "all");
+  }, [billing, selectedOrganizationId, updateOrganizationFilter]);
+
+  const handleProvision = useCallback(async () => {
+    setProvisioning(true);
+    setError(null);
+    try {
+      const headers = await getOctogenRequestHeaders();
+      const workspaceId =
+        selectedOrganizationId && selectedOrganizationId !== "all" ? selectedOrganizationId : null;
+      const response = await fetch("/api/octogen/vms/provision", {
+        method: "POST",
+        headers: {
+          ...headers,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          workspaceId,
+        }),
+      });
+      const data = await parseApiResponse<{ vm: OctogenVm }>(response);
+      setVm(data.vm);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Provisioning failed");
+    } finally {
+      setProvisioning(false);
+    }
+  }, [getOctogenRequestHeaders, selectedOrganizationId]);
+
+  const handleCreateAgent = useCallback(async () => {
+    setCreatingAgent(true);
+    setError(null);
+    setOnboardingMessage(null);
+    try {
+      const headers = await getOctogenRequestHeaders({
+        "content-type": "application/json",
+      });
+      const response = await fetch("/api/octogen/agents", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          name: "Hermes Agent",
+          workspaceId: activeWorkspaceId,
+          vmId: vm?.id || null,
+        }),
+      });
+      const data = await parseApiResponse<{
+        agent: OctogenAgent;
+        summary: OctogenAgentWorkspaceSummary;
+      }>(response);
+      setAgents((current) => [
+        data.agent,
+        ...current.filter((agent) => agent.id !== data.agent.id),
+      ]);
+      setAgentSummary(data.summary);
+      setOnboardingMessage("Hermes agent created. Next: provision its Hermes runtime.");
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to create Hermes agent");
+    } finally {
+      setCreatingAgent(false);
+    }
+  }, [activeWorkspaceId, getOctogenRequestHeaders, vm?.id]);
+
+  const handleProvisionAgentRuntime = useCallback(
+    async (agent: OctogenAgent) => {
+      setProvisioningRuntimeAgentId(agent.id);
+      setError(null);
+      setOnboardingMessage(null);
+      try {
+        const headers = await getOctogenRequestHeaders({
+          "content-type": "application/json",
+        });
+        const response = await fetch("/api/octogen/agents/runtime/provision", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            agentId: agent.id,
+            workspaceId: activeWorkspaceId,
+          }),
+        });
+        const data = await parseApiResponse<{
+          agent: OctogenAgent;
+          summary: OctogenAgentWorkspaceSummary;
+          message?: string;
+          nextStep?: string;
+        }>(response);
+        setAgents((current) =>
+          current.map((candidate) => (candidate.id === data.agent.id ? data.agent : candidate)),
+        );
+        setAgentSummary(data.summary);
+        setOnboardingMessage(
+          data.message ||
+            data.nextStep ||
+            "Hermes runtime provisioning queued. Next: connect the runner and install AI Provider.",
+        );
+      } catch (err: unknown) {
+        setError(err instanceof Error ? err.message : "Failed to provision Hermes runtime");
+      } finally {
+        setProvisioningRuntimeAgentId(null);
+      }
+    },
+    [activeWorkspaceId, getOctogenRequestHeaders],
+  );
+
+  const handleRefreshHealth = useCallback(
+    async (silent = false) => {
+      if (!silent) {
+        setRefreshingHealth(true);
+        setError(null);
+      }
+
+      try {
+        const headers = await getOctogenRequestHeaders();
+        const response = await fetch("/api/octogen/vms/health?sync=1", {
+          method: "GET",
+          headers,
+          cache: "no-store",
+        });
+        const data = await parseApiResponse<{ vm: OctogenVm | null; error?: string }>(response);
+        setVm(data.vm);
+        if (!silent && data.error) {
+          setError(data.error);
+        }
+      } catch (err: unknown) {
+        if (!silent) {
+          setError(err instanceof Error ? err.message : "Health check failed");
+        }
+      } finally {
+        if (!silent) {
+          setRefreshingHealth(false);
+        }
+      }
+    },
+    [getOctogenRequestHeaders],
+  );
+
+  const handleRecover = useCallback(async () => {
+    setRecovering(true);
+    setError(null);
+    try {
+      const headers = await getOctogenRequestHeaders();
+      const response = await fetch("/api/octogen/vms/recover", {
+        method: "POST",
+        headers,
+      });
+      const data = await parseApiResponse<{ vm: OctogenVm }>(response);
+      setVm(data.vm);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Recovery failed");
+    } finally {
+      setRecovering(false);
+    }
+  }, [getOctogenRequestHeaders]);
+
+  const handleRestartGateway = useCallback(async () => {
+    setRestartingGateway(true);
+    setError(null);
+    setOnboardingMessage(null);
+    try {
+      const headers = await getOctogenRequestHeaders();
+      const response = await fetch("/api/octogen/vms/restart-gateway", {
+        method: "POST",
+        headers,
+      });
+      const data = await parseApiResponse<{ vm: OctogenVm; restarted: boolean }>(response);
+      setVm(data.vm);
+      setOnboardingMessage(
+        data.restarted
+          ? "Gateway restarted. If chat is reconnecting, wait a few seconds then try again."
+          : "Gateway restart requested. Upstream is still warming up; click Sync Health in a few seconds.",
+      );
+      void handleRefreshHealth(true);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Gateway restart failed");
+    } finally {
+      setRestartingGateway(false);
+    }
+  }, [getOctogenRequestHeaders, handleRefreshHealth]);
+
+  const handleUpdateControlUi = useCallback(async () => {
+    setUpdatingControlUi(true);
+    setError(null);
+    setOnboardingMessage(null);
+    try {
+      const headers = await getOctogenRequestHeaders();
+      const response = await fetch("/api/octogen/vms/sync-release", {
+        method: "POST",
+        headers,
+      });
+      const data = await parseApiResponse<{
+        vm: OctogenVm;
+        updated: boolean;
+        message?: string;
+      }>(response);
+      setVm(data.vm);
+      setOnboardingMessage(
+        typeof data.message === "string" && data.message.trim()
+          ? data.message
+          : data.updated
+            ? "Workspace release updated for this VM."
+            : "Workspace release is already up to date for this VM.",
+      );
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to sync workspace release");
+    } finally {
+      setUpdatingControlUi(false);
+    }
+  }, [getOctogenRequestHeaders]);
+
+  const handleOpenControlUi = useCallback(async () => {
+    setOpeningControlUi(true);
+    setError(null);
+    try {
+      const headers = await getOctogenRequestHeaders();
+      const response = await fetch("/api/octogen/vms/launch-control-ui", {
+        method: "POST",
+        headers,
+      });
+      const data = await parseApiResponse<{ launchUrl: string; vm: OctogenVm }>(response);
+      setVm(data.vm);
+      window.open(data.launchUrl, "_blank", "noopener,noreferrer");
+    } catch (err: unknown) {
+      if (err instanceof ApiError && err.code === "VM_BOOTING") {
+        setError(
+          "Your VM is running, but OpenClaw is still booting (usually 1-3 minutes on first boot). We will keep syncing health automatically.",
+        );
+        setVm((current) => (current ? { ...current, status: "provisioning" } : current));
+        void handleRefreshHealth(true);
+      } else if (err instanceof ApiError && err.code === "ONBOARDING_REQUIRED") {
+        setError('Please complete "How would you like to cook your 🦞?" before launching gateway.');
+      } else {
+        setError(err instanceof Error ? err.message : "Failed to open Control UI");
+      }
+    } finally {
+      setOpeningControlUi(false);
+    }
+  }, [getOctogenRequestHeaders, handleRefreshHealth]);
+
+  const applyOnboardingResult = useCallback((rawResult: unknown) => {
+    const result = normalizeWizardResult(rawResult);
+    setOnboardingStatus(result.status || null);
+    setOnboardingError(result.error || null);
+
+    if (result.done || !result.step) {
+      setOnboardingStep(null);
+      setOnboardingStepValue(null);
+      return result;
+    }
+
+    setOnboardingStep(result.step);
+    setOnboardingStepValue(deriveInitialStepValue(result.step));
+    return result;
+  }, []);
+
+  const handleStartTerminalOnboarding = useCallback(async () => {
+    setOnboardingBusy(true);
+    setOnboardingError(null);
+    setOnboardingMessage(null);
+    setOnboardingOAuthUrl(null);
+    try {
+      const headers = await getOctogenRequestHeaders();
+      const response = await fetch("/api/octogen/vms/onboarding/start", {
+        method: "POST",
+        headers,
+      });
+      const data = await parseApiResponse<{
+        sessionId: string;
+        result: unknown;
+        vm: OctogenVm;
+      }>(response);
+      setVm(data.vm);
+      setOnboardingSessionId(data.sessionId);
+      const result = applyOnboardingResult(data.result);
+      if (result.done) {
+        setOnboardingSessionId(null);
+        setManualWizardMode(false);
+        setOnboardingMessage(
+          result.status === "done"
+            ? "Setup completed. Next: open Gateway and use Desktop Live to observe VM browser actions."
+            : result.error || "Onboarding completed.",
+        );
+      }
+    } catch (err: unknown) {
+      if (isGatewayWebSocketOpenError(err)) {
+        // The VM is reachable but the gateway is not ready yet (or restarting).
+        // Syncing health will downgrade the vm to "Starting" until the gateway responds.
+        void handleRefreshHealth(true);
+      }
+      setOnboardingError(err instanceof Error ? err.message : "Failed to start onboarding");
+    } finally {
+      setOnboardingBusy(false);
+    }
+  }, [applyOnboardingResult, getOctogenRequestHeaders, handleRefreshHealth]);
+
+  const handleOpenOnboardingOAuthLogin = useCallback(async () => {
+    if (onboardingOAuthUrl) {
+      window.open(onboardingOAuthUrl, "_blank", "noopener,noreferrer");
+      return;
+    }
+    setOnboardingOAuthBusy(true);
+    setOnboardingError(null);
+    try {
+      const headers = await getOctogenRequestHeaders();
+      const response = await fetch(`/api/octogen/vms/onboarding/codex-auth-url?ts=${Date.now()}`, {
+        method: "GET",
+        headers,
+        cache: "no-store",
+      });
+      const data = await parseApiResponse<{
+        vm: OctogenVm;
+        authUrl: string | null;
+      }>(response);
+      setVm(data.vm);
+      setOnboardingOAuthUrl(data.authUrl);
+      if (!data.authUrl) {
+        setOnboardingError(
+          "ChatGPT login URL is not ready yet. Please click again in 1-2 seconds.",
+        );
+        return;
+      }
+      window.open(data.authUrl, "_blank", "noopener,noreferrer");
+    } catch (err: unknown) {
+      setOnboardingError(err instanceof Error ? err.message : "Failed to fetch ChatGPT login URL");
+    } finally {
+      setOnboardingOAuthBusy(false);
+    }
+  }, [getOctogenRequestHeaders, onboardingOAuthUrl]);
+
+  const handleSubmitTerminalOnboardingStep = useCallback(async () => {
+    if (!onboardingSessionId) {
+      setOnboardingError("Onboarding session not found. Start again.");
+      return;
+    }
+
+    let answer:
+      | {
+          stepId: string;
+          value: unknown;
+        }
+      | undefined;
+    if (onboardingStep) {
+      if (onboardingStep.type === "multiselect") {
+        answer = {
+          stepId: onboardingStep.id,
+          value: Array.isArray(onboardingStepValue) ? onboardingStepValue : [],
+        };
+      } else if (onboardingStep.type === "confirm") {
+        answer = {
+          stepId: onboardingStep.id,
+          value: Boolean(onboardingStepValue),
+        };
+      } else if (onboardingStep.type === "text") {
+        answer = {
+          stepId: onboardingStep.id,
+          value: typeof onboardingStepValue === "string" ? onboardingStepValue : "",
+        };
+      } else if (onboardingStep.type === "select") {
+        const fallbackValue = onboardingStep.options?.[0]?.value;
+        const selectedValue =
+          onboardingStepValue !== undefined && onboardingStepValue !== null
+            ? onboardingStepValue
+            : fallbackValue;
+        if (selectedValue === undefined) {
+          setOnboardingError("No selectable option available for this step.");
+          return;
+        }
+        answer = {
+          stepId: onboardingStep.id,
+          value: selectedValue,
+        };
+      } else {
+        // Gateway wizard sessions require acknowledging note/action/progress
+        // steps with a stepId so the runner can advance.
+        answer = {
+          stepId: onboardingStep.id,
+          value: null,
+        };
+      }
+    }
+
+    setOnboardingBusy(true);
+    setOnboardingAutoFinishing(false);
+    setOnboardingError(null);
+    setOnboardingMessage(null);
+    try {
+      const maxHandshakeAttempts = 4;
+      const warmupDeadline = Date.now() + ONBOARDING_GATEWAY_WARMUP_RETRY_WINDOW_MS;
+      let handshakeAttempt = 0;
+      while (true) {
+        try {
+          const headers = await getOctogenRequestHeaders();
+          const response = await fetch("/api/octogen/vms/onboarding/next", {
+            method: "POST",
+            headers: {
+              ...headers,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              sessionId: onboardingSessionId,
+              ...(answer ? { answer } : {}),
+            }),
+          });
+          const data = await parseApiResponse<{
+            result: unknown;
+            vm: OctogenVm;
+          }>(response);
+          setVm(data.vm);
+          const result = applyOnboardingResult(data.result);
+          if (result.done) {
+            setOnboardingSessionId(null);
+            setManualWizardMode(false);
+            setOnboardingOAuthUrl(null);
+            setOnboardingMessage(
+              result.status === "done"
+                ? "Setup completed. Next: open Gateway and use Desktop Live to observe VM browser actions."
+                : result.error || "Onboarding finished.",
+            );
+          }
+          return;
+        } catch (err: unknown) {
+          const retryableHandshake =
+            isGatewayHandshakeError(err) || isGatewayWebSocketOpenError(err);
+          if (retryableHandshake && handshakeAttempt < maxHandshakeAttempts - 1) {
+            const delay = 150 + handshakeAttempt * 250;
+            handshakeAttempt += 1;
+            await new Promise((resolve) => setTimeout(resolve, delay));
+            continue;
+          }
+          if (isGatewayWarmupError(err) && Date.now() < warmupDeadline) {
+            setOnboardingAutoFinishing(true);
+            setOnboardingError(null);
+            setOnboardingMessage(
+              "ChatGPT login succeeded. Finishing setup while the gateway starts…",
+            );
+            await handleRefreshHealth(true);
+            await new Promise((resolve) =>
+              setTimeout(resolve, ONBOARDING_GATEWAY_WARMUP_RETRY_DELAY_MS),
+            );
+            continue;
+          }
+          throw err;
+        }
+      }
+    } catch (err: unknown) {
+      if (err instanceof ApiError && err.code === "WIZARD_SESSION_EXPIRED") {
+        setOnboardingSessionId(null);
+        setOnboardingStep(null);
+        setOnboardingStepValue(null);
+        setOnboardingOAuthUrl(null);
+      }
+      if (isGatewayWarmupError(err)) {
+        void handleRefreshHealth(true);
+        setOnboardingMessage(
+          "Finishing setup is taking longer than expected. Leave this page open a little longer, or try Restart Gateway once.",
+        );
+        return;
+      }
+      if (isGatewayWebSocketOpenError(err)) {
+        void handleRefreshHealth(true);
+      }
+      setOnboardingError(err instanceof Error ? err.message : "Failed to continue onboarding");
+    } finally {
+      setOnboardingBusy(false);
+      setOnboardingAutoFinishing(false);
+    }
+  }, [
+    applyOnboardingResult,
+    getOctogenRequestHeaders,
+    handleRefreshHealth,
+    onboardingSessionId,
+    onboardingStep,
+    onboardingStepValue,
+  ]);
+
+  const handleCancelTerminalOnboarding = useCallback(async () => {
+    if (!onboardingSessionId) {
+      setOnboardingSessionId(null);
+      setOnboardingStep(null);
+      setOnboardingStepValue(null);
+      setOnboardingStatus(null);
+      setOnboardingOAuthUrl(null);
+      return;
+    }
+
+    setOnboardingBusy(true);
+    setOnboardingError(null);
+    try {
+      const headers = await getOctogenRequestHeaders();
+      const response = await fetch("/api/octogen/vms/onboarding/cancel", {
+        method: "POST",
+        headers: {
+          ...headers,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sessionId: onboardingSessionId }),
+      });
+      const data = await parseApiResponse<{
+        vm: OctogenVm;
+        status: {
+          status?: unknown;
+          error?: unknown;
+        };
+      }>(response);
+      setVm(data.vm);
+      setOnboardingSessionId(null);
+      setOnboardingStep(null);
+      setOnboardingStepValue(null);
+      setOnboardingStatus(
+        isOnboardingStatus(data.status?.status) ? data.status.status : "cancelled",
+      );
+      setOnboardingError(typeof data.status?.error === "string" ? data.status.error : null);
+      setOnboardingMessage("Onboarding wizard cancelled.");
+      setOnboardingOAuthUrl(null);
+      setManualWizardMode(false);
+    } catch (err: unknown) {
+      setOnboardingError(err instanceof Error ? err.message : "Failed to cancel onboarding");
+    } finally {
+      setOnboardingBusy(false);
+    }
+  }, [getOctogenRequestHeaders, onboardingSessionId]);
+
+  useEffect(() => {
+    if (user) {
+      void loadCurrent();
+      void loadAgents();
+      return;
+    }
+    setOrgAccessRequired(false);
+    setAgents([]);
+    setAgentSummary(null);
+  }, [user, loadCurrent, loadAgents]);
+
+  useEffect(() => {
+    setOnboardingSessionId(null);
+    setOnboardingStep(null);
+    setOnboardingStepValue(null);
+    setOnboardingStatus(null);
+    setOnboardingError(null);
+    setOnboardingMessage(null);
+    setOnboardingAutoFinishing(false);
+    setOnboardingOAuthUrl(null);
+    setManualWizardMode(false);
+  }, [vm?.id]);
+
+  useEffect(() => {
+    setOnboardingOAuthUrl(null);
+  }, [onboardingStep?.id]);
+
+  const isBooting = useMemo(() => {
+    if (!vm) {
+      return false;
+    }
+    if (POLLING_STATUSES.has(vm.status)) {
+      return true;
+    }
+    return vm.status === "running" && !vm.provisioned_at;
+  }, [vm]);
+
+  useEffect(() => {
+    if (!isBooting) {
+      return;
+    }
+    const timer = setInterval(() => {
+      void handleRefreshHealth(true);
+    }, 12000);
+    return () => clearInterval(timer);
+  }, [isBooting, handleRefreshHealth]);
+
+  const canOpenSession = useMemo(
+    () => vm?.status === "running" && Boolean(vm.provisioned_at),
+    [vm?.status, vm?.provisioned_at],
+  );
+  const onboardingCompleted = useMemo(() => isVmOnboardingComplete(vm), [vm]);
+  const canLaunchGateway = canOpenSession && onboardingCompleted;
+  const isWorkspaceLoading = isAuthLoading || (!!user && !hasLoaded);
+  const hasProvisionedServer = Boolean(vm?.hetzner_server_id);
+  const workspaceStage = useMemo<WorkspaceStage>(() => {
+    if (
+      !vm ||
+      vm.status === "terminated" ||
+      (!hasProvisionedServer && vm.status !== "provisioning")
+    ) {
+      return "deploy";
+    }
+    if (isBooting) {
+      return "booting";
+    }
+    if (canOpenSession && !onboardingCompleted) {
+      return "wizard";
+    }
+    return "gateway";
+  }, [canOpenSession, hasProvisionedServer, vm, isBooting, onboardingCompleted]);
+  const showHelpActions =
+    hasProvisionedServer &&
+    (vm?.status === "error" || vm?.status === "stopped" || vm?.status === "recovering");
+  const showWizardSection =
+    canOpenSession &&
+    (workspaceStage === "wizard" || manualWizardMode || onboardingSessionId !== null);
+  const showOAuthLoginShortcut = isRedirectUrlInputStep(onboardingStep);
+  const isPreparingOrStarting = isWorkspaceLoading || workspaceStage === "booting";
+  const loadingLine = OCTOGEN_LOADING_LINES[loadingMessageIndex];
+  const vmName = useMemo(() => {
+    const value = typeof vm?.server_name === "string" ? vm.server_name.trim() : "";
+    return value || "Unknown";
+  }, [vm?.server_name]);
+  const organizationBalanceSummary = useMemo(() => {
+    if (!billing) {
+      return {
+        value: "—",
+        detail: "Workspace balance is syncing.",
+        label: "Workspace",
+        tone: "neutral" as const,
+      };
+    }
+    if (billing.status === "unavailable") {
+      return {
+        value: "Unavailable",
+        detail: billing.message || "Workspace billing data is temporarily unavailable.",
+        label: "Workspace",
+        tone: "warning" as const,
+      };
+    }
+    if (billing.selectedOrganizationId) {
+      const selectedBalance = Number(billing.selectedOrganizationPrepaidBalance ?? 0);
+      return {
+        value: formatCurrencyUsd(Number.isFinite(selectedBalance) ? selectedBalance : 0),
+        detail: "Usage will charge this workspace balance.",
+        label: billing.selectedOrganizationName || "Selected workspace",
+        tone: selectedBalance > 0 ? ("positive" as const) : ("neutral" as const),
+      };
+    }
+    if (billing.organizationMembershipCount === 0) {
+      return {
+        value: formatCurrencyUsd(0),
+        detail: "No linked workspace membership yet.",
+        label: "Workspace",
+        tone: "neutral" as const,
+      };
+    }
+
+    const orgLabel =
+      billing.organizationSubscriptionCount === 1
+        ? "active workspace subscription"
+        : "active workspace subscriptions";
+    if (billing.organizationSubscriptionCount === 0) {
+      return {
+        value: formatCurrencyUsd(0),
+        detail: `Linked to ${billing.organizationMembershipCount} workspaces, but no active CreateNow prepaid subscription found.`,
+        label: "Workspace",
+        tone: "neutral" as const,
+      };
+    }
+
+    return {
+      value: formatCurrencyUsd(billing.organizationPrepaidBalance),
+      detail: `Across ${billing.organizationSubscriptionCount} ${orgLabel}.`,
+      label: "Workspace",
+      tone: "positive" as const,
+    };
+  }, [billing]);
+
+  const bootingWarnings = useMemo(() => {
+    const normalize = (value: string) => value.trim().toLowerCase().replace(/\s+/g, " ");
+    const notices: string[] = [];
+    const seen = new Set<string>();
+    const addNotice = (value: string | null | undefined) => {
+      const message = typeof value === "string" ? value.trim() : "";
+      if (!message) {
+        return;
+      }
+      const key = normalize(message);
+      if (seen.has(key)) {
+        return;
+      }
+      seen.add(key);
+      notices.push(message);
+    };
+
+    addNotice(error);
+    addNotice(vm?.last_error);
+
+    const defaultKey = normalize(DEFAULT_BOOTING_NOTICE);
+    const hasNonDefaultNotice = notices.some((message) => normalize(message) !== defaultKey);
+    if (!hasNonDefaultNotice) {
+      addNotice(DEFAULT_BOOTING_NOTICE);
+    }
+
+    return notices;
+  }, [error, vm?.last_error]);
+
+  useEffect(() => {
+    if (!canOpenSession) {
+      setManualWizardMode(false);
+    }
+  }, [canOpenSession]);
+
+  useEffect(() => {
+    if (!isPreparingOrStarting) {
+      return;
+    }
+    const timer = setInterval(() => {
+      setLoadingMessageIndex((current) => (current + 1) % OCTOGEN_LOADING_LINES.length);
+    }, 2200);
+    return () => clearInterval(timer);
+  }, [isPreparingOrStarting]);
+
+  return (
+    <div className="min-h-screen bg-[#F7F7F5] text-[#191919]">
+      <header className="sticky top-0 z-10 border-b border-[#ECECEC] bg-[#F7F7F5]/90 px-4 py-4 backdrop-blur md:px-8">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => router.push("/")}
+              className="inline-flex items-center gap-2 rounded-full border border-[#E4E4E4] bg-white px-3 py-1.5 text-sm text-[#666] transition hover:border-[#D8D8D8] hover:text-[#111]"
+            >
+              <ArrowLeft className="h-4 w-4" />
+              Back
+            </button>
+            <div className="hidden h-5 w-px bg-[#E7E7E7] md:block" />
+            <p className="text-sm font-medium uppercase tracking-[0.22em] text-[#6D6D6D]">
+              Octogen Console
+            </p>
+          </div>
+
+          {user && !isWorkspaceLoading && !orgAccessRequired && (
+            <div className="flex flex-wrap items-center gap-2">
+              {billing?.status === "ok" && (billing.organizations || []).length > 1 && (
+                <select
+                  value={selectedOrganizationId}
+                  onChange={(event) => updateOrganizationFilter(event.target.value)}
+                  className="h-9 rounded-full border border-[#DCDCDC] bg-white px-3 text-sm text-[#333] outline-none transition hover:border-[#CFCFCF] focus:border-[#BDBDBD]"
+                >
+                  <option value="all">Select workspace</option>
+                  {billing.organizations.map((organization) => (
+                    <option key={organization.id} value={organization.id}>
+                      {organization.name}
+                    </option>
+                  ))}
+                </select>
+              )}
+
+              <div
+                className={`inline-flex min-h-9 items-center gap-2 rounded-full border px-3 py-1 text-sm font-medium ${
+                  organizationBalanceSummary.tone === "warning"
+                    ? "border-[#F1D1D1] bg-[#FFF6F6] text-[#9D1B1B]"
+                    : organizationBalanceSummary.tone === "positive"
+                      ? "border-[#DCEFD9] bg-[#F6FFF4] text-[#0B7A2A]"
+                      : "border-[#EAEAEA] bg-white text-[#555]"
+                }`}
+              >
+                <span className="text-xs uppercase tracking-[0.12em] text-[#7A7A7A]">
+                  {organizationBalanceSummary.label}
+                </span>
+                <span>{organizationBalanceSummary.value}</span>
+              </div>
+            </div>
+          )}
+        </div>
+      </header>
+
+      <main className="mx-auto w-full max-w-4xl px-4 py-10 md:px-8 md:py-14">
+        {isWorkspaceLoading ? (
+          <section className="mx-auto max-w-3xl rounded-3xl border border-[#EAEAEA] bg-white p-8 shadow-[0_10px_35px_rgba(0,0,0,0.05)] md:p-10">
+            <div className="inline-flex items-center gap-2 rounded-full border border-[#E7E7E7] bg-[#FAFAFA] px-3 py-1 text-xs font-medium text-[#5F5F5F]">
+              <Loader2 className="h-3.5 w-3.5 animate-spin text-[#222]" />
+              Starting workspace
+            </div>
+
+            <h2 className="mt-5 text-3xl font-semibold tracking-tight text-[#111] md:text-4xl">
+              Preparing your OpenClaw workspace
+            </h2>
+            <p className="mt-3 text-sm leading-relaxed text-[#666] md:text-base">
+              <span className="block animate-pulse">{loadingLine}</span>
+            </p>
+
+            <div className="mt-7 space-y-3">
+              <div className="flex items-center gap-3 rounded-2xl border border-[#EFEFEF] bg-[#FAFAFA] px-4 py-3 text-sm text-[#444]">
+                <span className="h-2 w-2 animate-pulse rounded-full bg-[#111]" />
+                Checking account session
+              </div>
+              <div className="flex items-center gap-3 rounded-2xl border border-[#EFEFEF] bg-[#FAFAFA] px-4 py-3 text-sm text-[#444]">
+                <span className="h-2 w-2 animate-pulse rounded-full bg-[#111]" />
+                Syncing your dedicated VM
+              </div>
+              <div className="flex items-center gap-3 rounded-2xl border border-[#EFEFEF] bg-[#FAFAFA] px-4 py-3 text-sm text-[#444]">
+                <span className="h-2 w-2 animate-pulse rounded-full bg-[#111]" />
+                {loadingLine}
+              </div>
+            </div>
+
+            <div className="mt-6 h-2 overflow-hidden rounded-full bg-[#ECECEC]">
+              <div className="h-full w-2/5 animate-pulse rounded-full bg-[#111]" />
+            </div>
+            <p className="mt-3 text-xs text-[#7A7A7A]">
+              Usually a few seconds. First boot may take around 1-3 minutes.
+            </p>
+          </section>
+        ) : !user ? (
+          <section className="mx-auto max-w-xl rounded-3xl border border-[#EAEAEA] bg-white p-8 text-center shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+            <h2 className="text-2xl font-semibold tracking-tight text-[#111]">
+              Sign in to OCTOGEN CONSOLE
+            </h2>
+            <p className="mt-3 text-sm text-[#666]">
+              Continue with your CreateNow auth to manage your dedicated OpenClaw VM.
+            </p>
+            <button
+              onClick={() => setIsAuthModalOpen(true)}
+              className="mt-6 inline-flex items-center gap-2 rounded-full bg-[#111] px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-[#2A2A2A]"
+            >
+              Continue with Email
+            </button>
+          </section>
+        ) : orgAccessRequired ? (
+          <section className="mx-auto max-w-2xl rounded-3xl border border-[#EAEAEA] bg-white p-8 text-center shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+            <h2 className="text-2xl font-semibold tracking-tight text-[#111]">
+              Workspace membership required
+            </h2>
+            <p className="mt-3 text-sm leading-relaxed text-[#666]">
+              OCTOGEN CONSOLE is temporarily available to workspace members only. Join a workspace
+              first, then return to deploy your VM.
+            </p>
+            {error && (
+              <div className="mt-4 rounded-2xl border border-[#F1D1D1] bg-[#FFF6F6] px-4 py-3 text-sm text-[#9D1B1B]">
+                {error}
+              </div>
+            )}
+            <button
+              onClick={() => router.push("/")}
+              className="mt-6 inline-flex items-center gap-2 rounded-full bg-[#111] px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-[#2A2A2A]"
+            >
+              Back to Dashboard
+            </button>
+          </section>
+        ) : workspaceStage === "deploy" ? (
+          <section className="mx-auto max-w-3xl rounded-3xl border border-[#EAEAEA] bg-white p-8 shadow-[0_10px_35px_rgba(0,0,0,0.05)] md:p-12">
+            <h1 className="text-4xl font-semibold tracking-tight text-[#111] md:text-5xl">
+              Deploy your first 🦞
+            </h1>
+            <p className="mt-4 max-w-2xl text-sm leading-relaxed text-[#555] md:text-base">
+              Start your own OpenClaw cloud workspace in one click.
+            </p>
+
+            {vm && (
+              <div className="mt-5 rounded-2xl border border-[#EFEFEF] bg-[#FAFAFA] px-4 py-3 text-sm text-[#555]">
+                {vm.last_error || "No active VM found. Deploy a new one to continue."}
+              </div>
+            )}
+
+            {error && (
+              <div className="mt-6 rounded-2xl border border-[#F1D1D1] bg-[#FFF6F6] px-4 py-3 text-sm text-[#9D1B1B]">
+                {error}
+              </div>
+            )}
+
+            <button
+              onClick={handleProvision}
+              disabled={provisioning}
+              className="mt-8 inline-flex items-center gap-2 rounded-full bg-[#111] px-6 py-3 text-sm font-semibold text-white transition hover:bg-[#2A2A2A] disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {provisioning ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Server className="h-4 w-4" />
+              )}
+              {provisioning ? "Deploying VM..." : "Deploy VM"}
+            </button>
+          </section>
+        ) : workspaceStage === "booting" ? (
+          <section className="mx-auto max-w-3xl rounded-3xl border border-[#EAEAEA] bg-white p-8 shadow-[0_10px_35px_rgba(0,0,0,0.05)] md:p-10">
+            <div className="flex flex-wrap items-start justify-between gap-4">
+              <div>
+                <p className="text-xs uppercase tracking-[0.2em] text-[#8A8A8A]">Workspace</p>
+                <h2 className="mt-2 text-3xl font-semibold tracking-tight text-[#111]">OpenClaw</h2>
+                <p className="mt-2 text-sm text-[#666]">
+                  Deploy VM -&gt; Setup Wizard -&gt; Launch Gateway.
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                <span className="rounded-full border border-[#EAEAEA] bg-white px-3 py-1 text-xs font-medium text-[#555]">
+                  VM: <span className="font-semibold text-[#222]">{vmName}</span>
+                </span>
+                <span
+                  className={`rounded-full border px-3 py-1 text-xs font-medium ${getStatusClass(vm?.status)}`}
+                >
+                  {getStatusLabel(vm?.status)}
+                </span>
+              </div>
+            </div>
+
+            {bootingWarnings.map((warning, index) => (
+              <div
+                key={`booting-warning-${index}`}
+                className="mt-4 rounded-2xl border border-[#F1D1D1] bg-[#FFF6F6] px-4 py-3 text-sm text-[#B3261E]"
+              >
+                {warning}
+              </div>
+            ))}
+
+            <div className="mt-4 rounded-2xl border border-[#EFEFEF] bg-[#FAFAFA] px-4 py-4">
+              <div className="flex items-center gap-2 text-sm font-medium text-[#1A1A1A]">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                {loadingLine}
+              </div>
+              <p className="mt-2 text-xs text-[#666]">
+                First boot can take around 1-3 minutes. We are syncing health automatically.
+              </p>
+              <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-[#ECECEC]">
+                <div className="h-full w-1/3 animate-pulse rounded-full bg-[#111]" />
+              </div>
+            </div>
+
+            <div className="mt-5 flex flex-wrap gap-2">
+              <button
+                onClick={() => void handleRefreshHealth(false)}
+                disabled={refreshingHealth}
+                className="inline-flex items-center gap-1.5 rounded-full border border-[#ECECEC] bg-[#FAFAFA] px-3 py-1.5 text-xs font-medium text-[#666] transition hover:bg-[#F3F3F3] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {refreshingHealth ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-4 w-4" />
+                )}
+                Sync Health
+              </button>
+
+              <button
+                onClick={handleRecover}
+                disabled={recovering || !hasProvisionedServer}
+                className="inline-flex items-center gap-1.5 rounded-full border border-[#ECECEC] bg-[#FAFAFA] px-3 py-1.5 text-xs font-medium text-[#666] transition hover:bg-[#F3F3F3] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {recovering ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Wrench className="h-4 w-4" />
+                )}
+                Recover VM
+              </button>
+            </div>
+          </section>
+        ) : showWizardSection ? (
+          <section className="mx-auto max-w-3xl rounded-3xl border border-[#EAEAEA] bg-white p-6 shadow-[0_10px_35px_rgba(0,0,0,0.05)] md:p-8">
+            <p className="text-xs uppercase tracking-[0.2em] text-[#8A8A8A]">Setup Wizard</p>
+            <h2 className="mt-2 text-3xl font-semibold tracking-tight text-[#111]">
+              How would you like to cook your 🦞?
+            </h2>
+            <p className="mt-2 text-sm text-[#666]">
+              Follow the prompts to connect your model and channels.
+            </p>
+            <div className="mt-3 inline-flex items-center rounded-full border border-[#EAEAEA] bg-white px-3 py-1 text-xs font-medium text-[#555]">
+              VM: <span className="ml-1 font-semibold text-[#222]">{vmName}</span>
+            </div>
+
+            {manualWizardMode && onboardingCompleted && (
+              <div className="mt-4">
+                <button
+                  onClick={() => setManualWizardMode(false)}
+                  className="inline-flex items-center justify-center gap-2 rounded-full border border-[#DCDCDC] bg-white px-5 py-2.5 text-sm font-semibold text-[#111] transition hover:bg-[#F6F6F6]"
+                >
+                  Back to Workspace
+                </button>
+              </div>
+            )}
+
+            {!onboardingSessionId ? (
+              <div className="mt-4 flex flex-wrap gap-3">
+                <button
+                  onClick={handleStartTerminalOnboarding}
+                  disabled={onboardingBusy || !canOpenSession}
+                  className="inline-flex items-center justify-center gap-2 rounded-full bg-[#111] px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-[#2A2A2A] disabled:cursor-not-allowed disabled:bg-[#D9D9D9] disabled:text-[#8E8E8E]"
+                >
+                  {onboardingBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                  {onboardingBusy ? "Starting wizard..." : "Start Cooking Wizard"}
+                </button>
+              </div>
+            ) : (
+              <div className="mt-4 inline-flex items-center rounded-full border border-[#DCDCDC] bg-white px-3 py-1 text-xs font-medium text-[#555]">
+                Session active: {onboardingSessionId.slice(0, 8)}...
+              </div>
+            )}
+
+            {onboardingStep && (
+              <div className="mt-4 rounded-2xl border border-[#EFEFEF] bg-white p-4">
+                {onboardingStep.title && (
+                  <p className="text-sm font-semibold text-[#1A1A1A]">{onboardingStep.title}</p>
+                )}
+                {onboardingStep.message && (
+                  <p className="mt-2 whitespace-pre-line text-sm text-[#555]">
+                    {onboardingStep.message}
+                  </p>
+                )}
+
+                {onboardingStep.type === "text" && (
+                  <div className="mt-3 space-y-3">
+                    <input
+                      type={onboardingStep.sensitive ? "password" : "text"}
+                      value={typeof onboardingStepValue === "string" ? onboardingStepValue : ""}
+                      onChange={(event) => setOnboardingStepValue(event.target.value)}
+                      placeholder={onboardingStep.placeholder || "Enter value"}
+                      className="w-full rounded-2xl border border-[#E5E5E5] bg-white px-4 py-2.5 text-sm text-[#111] outline-none transition focus:border-[#BDBDBD]"
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+
+                    {showOAuthLoginShortcut && (
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          onClick={handleOpenOnboardingOAuthLogin}
+                          disabled={onboardingBusy || onboardingOAuthBusy || !canOpenSession}
+                          className="inline-flex items-center gap-2 rounded-full border border-[#DCDCDC] bg-white px-4 py-2 text-sm font-medium text-[#111] transition hover:bg-[#F6F6F6] disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          {onboardingOAuthBusy ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <ExternalLink className="h-4 w-4" />
+                          )}
+                          {onboardingOAuthBusy ? "Preparing login URL..." : "Login with ChatGPT"}
+                        </button>
+
+                        <p className="text-xs text-[#777]">
+                          Sign in, then copy the full callback URL and paste it above.
+                        </p>
+
+                        {onboardingOAuthUrl && (
+                          <p className="w-full break-all text-xs text-[#666]">
+                            Latest URL ready: {onboardingOAuthUrl}
+                          </p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {onboardingStep.type === "confirm" && (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button
+                      onClick={() => setOnboardingStepValue(true)}
+                      className={`rounded-full px-4 py-2 text-sm font-medium transition ${
+                        onboardingStepValue
+                          ? "bg-[#111] text-white"
+                          : "border border-[#DCDCDC] bg-white text-[#555] hover:bg-[#F6F6F6]"
+                      }`}
+                    >
+                      Yes
+                    </button>
+                    <button
+                      onClick={() => setOnboardingStepValue(false)}
+                      className={`rounded-full px-4 py-2 text-sm font-medium transition ${
+                        onboardingStepValue === false
+                          ? "bg-[#111] text-white"
+                          : "border border-[#DCDCDC] bg-white text-[#555] hover:bg-[#F6F6F6]"
+                      }`}
+                    >
+                      No
+                    </button>
+                  </div>
+                )}
+
+                {onboardingStep.type === "select" && (
+                  <div className="mt-3 space-y-2">
+                    {(onboardingStep.options || []).map((option, index) => (
+                      <button
+                        key={`${onboardingStep.id}-${index}`}
+                        onClick={() => setOnboardingStepValue(option.value)}
+                        className={`w-full rounded-2xl border px-3 py-2 text-left text-sm transition ${
+                          Object.is(option.value, onboardingStepValue)
+                            ? "border-[#111] bg-white text-[#111]"
+                            : "border-[#E5E5E5] bg-white text-[#555] hover:border-[#CFCFCF]"
+                        }`}
+                      >
+                        <p className="font-medium">{option.label}</p>
+                        {option.hint && <p className="mt-0.5 text-xs text-[#777]">{option.hint}</p>}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {onboardingStep.type === "multiselect" && (
+                  <div className="mt-3 space-y-2">
+                    {(onboardingStep.options || []).map((option, index) => {
+                      const values = Array.isArray(onboardingStepValue) ? onboardingStepValue : [];
+                      const checked = isValueSelected(values, option.value);
+                      return (
+                        <button
+                          key={`${onboardingStep.id}-${index}`}
+                          onClick={() =>
+                            setOnboardingStepValue((current: unknown) => {
+                              const list = Array.isArray(current) ? current : [];
+                              if (isValueSelected(list, option.value)) {
+                                return list.filter((entry) => !Object.is(entry, option.value));
+                              }
+                              return [...list, option.value];
+                            })
+                          }
+                          className={`w-full rounded-2xl border px-3 py-2 text-left text-sm transition ${
+                            checked
+                              ? "border-[#111] bg-white text-[#111]"
+                              : "border-[#E5E5E5] bg-white text-[#555] hover:border-[#CFCFCF]"
+                          }`}
+                        >
+                          <p className="font-medium">
+                            {checked ? "✓ " : ""}
+                            {option.label}
+                          </p>
+                          {option.hint && (
+                            <p className="mt-0.5 text-xs text-[#777]">{option.hint}</p>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {onboardingSessionId && (
+              <div className="mt-4 flex flex-wrap gap-3">
+                <button
+                  onClick={handleSubmitTerminalOnboardingStep}
+                  disabled={onboardingBusy || !canOpenSession}
+                  className="inline-flex items-center justify-center gap-2 rounded-full bg-[#111] px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-[#2A2A2A] disabled:cursor-not-allowed disabled:bg-[#D9D9D9] disabled:text-[#8E8E8E]"
+                >
+                  {onboardingBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                  {onboardingBusy
+                    ? onboardingAutoFinishing
+                      ? "Finishing setup..."
+                      : "Running..."
+                    : onboardingStep && stepRequiresAnswer(onboardingStep)
+                      ? "Submit Step"
+                      : "Continue"}
+                </button>
+                <button
+                  onClick={handleCancelTerminalOnboarding}
+                  disabled={onboardingBusy}
+                  className="inline-flex items-center justify-center gap-2 rounded-full border border-[#DCDCDC] bg-white px-5 py-2.5 text-sm font-semibold text-[#111] transition hover:bg-[#F6F6F6] disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  Cancel Wizard
+                </button>
+              </div>
+            )}
+
+            {canOpenSession && (
+              <div className="mt-4 flex flex-wrap gap-2">
+                <button
+                  onClick={handleRestartGateway}
+                  disabled={restartingGateway || onboardingBusy}
+                  className="inline-flex items-center justify-center gap-2 rounded-full border border-[#DCDCDC] bg-white px-4 py-2 text-xs font-semibold text-[#111] transition hover:bg-[#F6F6F6] disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {restartingGateway ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <RefreshCw className="h-3.5 w-3.5" />
+                  )}
+                  {restartingGateway ? "Restarting Gateway..." : "Restart Gateway"}
+                </button>
+              </div>
+            )}
+
+            {onboardingStatus && (
+              <p className="mt-3 text-xs uppercase tracking-[0.14em] text-[#7A7A7A]">
+                Status: {onboardingStatus}
+              </p>
+            )}
+
+            {onboardingError && (
+              <div className="mt-3 rounded-2xl border border-[#F1D1D1] bg-[#FFF6F6] px-4 py-3 text-sm text-[#9D1B1B]">
+                {onboardingError}
+              </div>
+            )}
+
+            {onboardingError && /gateway websocket failed to open/i.test(onboardingError) && (
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button
+                  onClick={() => void handleRefreshHealth(false)}
+                  disabled={refreshingHealth}
+                  className="inline-flex items-center gap-1.5 rounded-full border border-[#ECECEC] bg-[#FAFAFA] px-3 py-1.5 text-xs font-medium text-[#666] transition hover:bg-[#F3F3F3] disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {refreshingHealth ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <RefreshCw className="h-4 w-4" />
+                  )}
+                  Sync Health
+                </button>
+
+                <button
+                  onClick={handleRecover}
+                  disabled={recovering || !hasProvisionedServer}
+                  className="inline-flex items-center gap-1.5 rounded-full border border-[#ECECEC] bg-[#FAFAFA] px-3 py-1.5 text-xs font-medium text-[#666] transition hover:bg-[#F3F3F3] disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {recovering ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Wrench className="h-4 w-4" />
+                  )}
+                  Recover VM
+                </button>
+              </div>
+            )}
+
+            {onboardingMessage && (
+              <div className="mt-3 rounded-2xl border border-[#EFEFEF] bg-white px-4 py-3 text-sm text-[#444]">
+                {onboardingMessage}
+              </div>
+            )}
+          </section>
+        ) : (
+          <section>
+            <div className="rounded-3xl border border-[#EAEAEA] bg-white p-6 shadow-[0_10px_35px_rgba(0,0,0,0.05)] md:p-8">
+              <div className="flex flex-wrap items-start justify-between gap-4">
+                <div>
+                  <p className="text-xs uppercase tracking-[0.2em] text-[#8A8A8A]">Workspace</p>
+                  <h2 className="mt-2 text-3xl font-semibold tracking-tight text-[#111]">
+                    OpenClaw
+                  </h2>
+                  <p className="mt-2 text-sm text-[#666]">
+                    Your dedicated cloud workspace is ready when status turns Ready.
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  <span className="rounded-full border border-[#EAEAEA] bg-white px-3 py-1 text-xs font-medium text-[#555]">
+                    VM: <span className="font-semibold text-[#222]">{vmName}</span>
+                  </span>
+                  <span
+                    className={`rounded-full border px-3 py-1 text-xs font-medium ${getStatusClass(vm?.status)}`}
+                  >
+                    {getStatusLabel(vm?.status)}
+                  </span>
+                </div>
+              </div>
+
+              <div className="mt-6 rounded-3xl border border-[#EFEFEF] bg-[#FAFAFA] p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.18em] text-[#8A8A8A]">
+                      Hermes Agents
+                    </p>
+                    <h3 className="mt-1 text-xl font-semibold tracking-tight text-[#111]">
+                      Agent fleet foundation
+                    </h3>
+                    <p className="mt-1 text-sm text-[#666]">
+                      Agents now live at workspace scope and will connect to AI providers, channels,
+                      skills, tasks, and Hermes runtime status.
+                    </p>
+                  </div>
+                  <button
+                    onClick={handleCreateAgent}
+                    disabled={creatingAgent || !canOpenSession}
+                    className="inline-flex items-center justify-center gap-2 rounded-full bg-[#111] px-4 py-2 text-sm font-semibold text-white transition hover:bg-[#2A2A2A] disabled:cursor-not-allowed disabled:bg-[#D9D9D9] disabled:text-[#8E8E8E]"
+                  >
+                    {creatingAgent ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                    {creatingAgent ? "Creating Agent..." : "Create Hermes Agent"}
+                  </button>
+                </div>
+
+                <div className="mt-4 grid gap-2 sm:grid-cols-4">
+                  <div className="rounded-2xl border border-[#E7E7E7] bg-white px-3 py-2">
+                    <p className="text-[11px] uppercase tracking-[0.12em] text-[#888]">Agents</p>
+                    <p className="mt-1 text-lg font-semibold text-[#111]">
+                      {agentSummary?.totalAgents ?? agents.length}
+                    </p>
+                  </div>
+                  <div className="rounded-2xl border border-[#E7E7E7] bg-white px-3 py-2">
+                    <p className="text-[11px] uppercase tracking-[0.12em] text-[#888]">Runtime</p>
+                    <p className="mt-1 text-lg font-semibold text-[#111]">
+                      {agentSummary?.runtimeReadyAgents ?? 0} ready /{" "}
+                      {agentSummary?.runtimeProvisioningAgents ?? 0} queued
+                    </p>
+                  </div>
+                  <div className="rounded-2xl border border-[#E7E7E7] bg-white px-3 py-2">
+                    <p className="text-[11px] uppercase tracking-[0.12em] text-[#888]">Providers</p>
+                    <p className="mt-1 text-lg font-semibold text-[#111]">
+                      {agentSummary?.missingProviders ?? 0} missing
+                    </p>
+                  </div>
+                  <div className="rounded-2xl border border-[#E7E7E7] bg-white px-3 py-2">
+                    <p className="text-[11px] uppercase tracking-[0.12em] text-[#888]">Channels</p>
+                    <p className="mt-1 text-lg font-semibold text-[#111]">
+                      {agentSummary?.connectedChannels ?? 0} connected
+                    </p>
+                  </div>
+                </div>
+
+                {agentSummary?.status === "unavailable" && (
+                  <div className="mt-3 rounded-2xl border border-[#EFE3C2] bg-[#FFFBEF] px-4 py-3 text-sm text-[#8A5A00]">
+                    {agentSummary.message || "Agent data is temporarily unavailable."}
+                  </div>
+                )}
+
+                {agents.length > 0 ? (
+                  <div className="mt-4 space-y-2">
+                    {agents.slice(0, 3).map((agent) => (
+                      <div
+                        key={agent.id}
+                        className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#E7E7E7] bg-white px-4 py-3"
+                      >
+                        <div>
+                          <p className="text-sm font-semibold text-[#111]">{agent.name}</p>
+                          <p className="mt-0.5 text-xs text-[#777]">
+                            Hermes profile: {agent.hermes_profile_id || "pending"}
+                          </p>
+                          <p className="mt-0.5 text-xs text-[#777]">
+                            Runtime: {getAgentRuntimeSummary(agent)}
+                          </p>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span
+                            className={`rounded-full border px-3 py-1 text-xs font-medium ${getAgentStatusClass(agent.status)}`}
+                          >
+                            {getAgentStatusLabel(agent.status)}
+                          </span>
+                          <span className="rounded-full border border-[#EAEAEA] bg-[#FAFAFA] px-3 py-1 text-xs font-medium text-[#666]">
+                            {
+                              (agent.providers || []).filter(
+                                (provider) => provider.status === "verified",
+                              ).length
+                            }{" "}
+                            provider ready
+                          </span>
+                          <span className="rounded-full border border-[#EAEAEA] bg-[#FAFAFA] px-3 py-1 text-xs font-medium text-[#666]">
+                            {
+                              (agent.channels || []).filter(
+                                (channel) => channel.status === "connected",
+                              ).length
+                            }{" "}
+                            channel connected
+                          </span>
+                          {shouldShowRuntimeProvisionAction(agent) && (
+                            <button
+                              onClick={() => void handleProvisionAgentRuntime(agent)}
+                              disabled={
+                                provisioningRuntimeAgentId === agent.id ||
+                                hasQueuedRuntimeProvision(agent)
+                              }
+                              className="inline-flex items-center gap-1.5 rounded-full border border-[#DCDCDC] bg-white px-3 py-1 text-xs font-semibold text-[#111] transition hover:bg-[#F6F6F6] disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                              {provisioningRuntimeAgentId === agent.id ? (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              ) : null}
+                              {provisioningRuntimeAgentId === agent.id
+                                ? "Queueing..."
+                                : hasQueuedRuntimeProvision(agent)
+                                  ? "Runtime Queued"
+                                  : "Provision Runtime"}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="mt-4 rounded-2xl border border-dashed border-[#DCDCDC] bg-white px-4 py-4 text-sm text-[#666]">
+                    No Hermes agents yet. Create one to start the runtime, provider, and channel
+                    onboarding path.
+                  </div>
+                )}
+              </div>
+
+              {error && (
+                <div className="mt-4 rounded-2xl border border-[#F1D1D1] bg-[#FFF6F6] px-4 py-3 text-sm text-[#9D1B1B]">
+                  {error}
+                </div>
+              )}
+
+              {vm?.last_error && (
+                <div className="mt-4 rounded-2xl border border-[#F1D1D1] bg-[#FFF6F6] px-4 py-3 text-sm text-[#9D1B1B]">
+                  {vm.last_error}
+                </div>
+              )}
+
+              <div className="mt-6 flex flex-wrap gap-3">
+                {vm?.status === "error" ? (
+                  <button
+                    onClick={handleProvision}
+                    disabled={provisioning}
+                    className="inline-flex items-center gap-2 rounded-full bg-[#111] px-6 py-3 text-sm font-semibold text-white shadow-[0_12px_24px_rgba(0,0,0,0.18)] transition hover:bg-[#2A2A2A] disabled:cursor-not-allowed disabled:bg-[#D9D9D9] disabled:text-[#8E8E8E]"
+                  >
+                    {provisioning ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Server className="h-4 w-4" />
+                    )}
+                    {provisioning ? "Redeploying VM..." : "Redeploy VM"}
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      onClick={handleOpenControlUi}
+                      disabled={!canLaunchGateway || openingControlUi}
+                      className="inline-flex items-center gap-2 rounded-full bg-[#111] px-6 py-3 text-sm font-semibold text-white shadow-[0_12px_24px_rgba(0,0,0,0.18)] transition hover:bg-[#2A2A2A] disabled:cursor-not-allowed disabled:bg-[#D9D9D9] disabled:text-[#8E8E8E]"
+                    >
+                      {openingControlUi ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <ExternalLink className="h-4 w-4" />
+                      )}
+                      {canLaunchGateway ? "Launch Gateway" : "Complete Setup Wizard First"}
+                    </button>
+
+                    {onboardingCompleted && canOpenSession && (
+                      <button
+                        onClick={() => {
+                          setManualWizardMode(true);
+                          setOnboardingError(null);
+                          setOnboardingMessage(null);
+                        }}
+                        disabled={onboardingBusy || Boolean(onboardingSessionId)}
+                        className="inline-flex items-center justify-center gap-2 rounded-full border border-[#DCDCDC] bg-white px-5 py-2.5 text-sm font-semibold text-[#111] transition hover:bg-[#F6F6F6] disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        Re-setup Wizard
+                      </button>
+                    )}
+
+                    {canOpenSession && (
+                      <button
+                        onClick={handleRestartGateway}
+                        disabled={restartingGateway || openingControlUi}
+                        className="inline-flex items-center justify-center gap-2 rounded-full border border-[#DCDCDC] bg-white px-5 py-2.5 text-sm font-semibold text-[#111] transition hover:bg-[#F6F6F6] disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {restartingGateway ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <RefreshCw className="h-4 w-4" />
+                        )}
+                        {restartingGateway ? "Restarting..." : "Restart Gateway"}
+                      </button>
+                    )}
+
+                    {canOpenSession && (
+                      <button
+                        onClick={handleUpdateControlUi}
+                        disabled={updatingControlUi || openingControlUi}
+                        className="inline-flex items-center justify-center gap-2 rounded-full border border-[#DCDCDC] bg-white px-5 py-2.5 text-sm font-semibold text-[#111] transition hover:bg-[#F6F6F6] disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {updatingControlUi ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <RefreshCw className="h-4 w-4" />
+                        )}
+                        {updatingControlUi ? "Syncing Release..." : "Sync Workspace Release"}
+                      </button>
+                    )}
+                  </>
+                )}
+              </div>
+
+              {canOpenSession && (
+                <div className="mt-4 rounded-2xl border border-[#EFEFEF] bg-[#FAFAFA] px-4 py-3 text-sm text-[#555]">
+                  <p>
+                    Browser automation now focuses on <strong>VM-side browser</strong>. Launch
+                    Gateway, then click <strong>Open Desktop Live</strong> in the Gateway top bar to
+                    watch the agent operate in real time.
+                  </p>
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <a
+                      href={OPENCLAW_BROWSER_DOC_URL}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center justify-center gap-2 rounded-full border border-[#DCDCDC] bg-white px-4 py-2 text-xs font-semibold text-[#111] transition hover:bg-[#F6F6F6]"
+                    >
+                      <ExternalLink className="h-3.5 w-3.5" />
+                      Browser Docs
+                    </a>
+                  </div>
+                  <p className="mt-2 text-xs text-[#777]">
+                    Recommended browser profile: <code>openclaw</code>. This route keeps execution
+                    in the VM and visible via Desktop Live.
+                  </p>
+                </div>
+              )}
+
+              <div className="mt-5 flex flex-wrap gap-2">
+                <button
+                  onClick={() => void handleRefreshHealth(false)}
+                  disabled={refreshingHealth}
+                  className="inline-flex items-center gap-1.5 rounded-full border border-[#ECECEC] bg-[#FAFAFA] px-3 py-1.5 text-xs font-medium text-[#666] transition hover:bg-[#F3F3F3] disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {refreshingHealth ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <RefreshCw className="h-4 w-4" />
+                  )}
+                  Sync Health
+                </button>
+
+                <button
+                  onClick={handleRecover}
+                  disabled={recovering || !hasProvisionedServer}
+                  className="inline-flex items-center gap-1.5 rounded-full border border-[#ECECEC] bg-[#FAFAFA] px-3 py-1.5 text-xs font-medium text-[#666] transition hover:bg-[#F3F3F3] disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {recovering ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Wrench className="h-4 w-4" />
+                  )}
+                  Recover VM
+                </button>
+              </div>
+
+              {showHelpActions && (
+                <p className="mt-3 text-xs text-[#8A8A8A]">
+                  If status is not Ready, try Recover VM once, then launch gateway again.
+                </p>
+              )}
+
+              {onboardingCompleted && (
+                <p className="mt-3 text-xs text-[#0B7A2A]">
+                  Setup wizard completed. Launch Gateway, then use Desktop Live to observe VM
+                  browser actions.
+                </p>
+              )}
+
+              {onboardingMessage && (
+                <div className="mt-3 rounded-2xl border border-[#EFEFEF] bg-[#FAFAFA] px-4 py-3 text-sm text-[#444]">
+                  {onboardingMessage}
+                </div>
+              )}
+            </div>
+          </section>
+        )}
+      </main>
+
+      <AuthModal isOpen={isAuthModalOpen} onClose={() => setIsAuthModalOpen(false)} />
+    </div>
+  );
+}

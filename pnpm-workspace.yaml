@@ -1,6 +1,6 @@
 packages:
   - .
-  - clawnow-control-plane
+  - octogen-console
   - ui
   - packages/*
   - extensions/*

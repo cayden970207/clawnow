@@ -1,0 +1,25 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+}
+
+body {
+  font-family:
+    "Avenir Next", "SF Pro Display", "IBM Plex Sans", "Source Sans 3", "Helvetica Neue", sans-serif;
+  background: #f7f7f5;
+  color: #191919;
+}

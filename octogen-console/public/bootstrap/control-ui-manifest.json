@@ -1,0 +1,8 @@
+{
+  "version": "2026.3.20-stable-release6",
+  "url": "https://claw-now.app/bootstrap/control-ui-2026.3.17-whatsapp-runtime1.tar.gz",
+  "sha256": "4af8d61dc320d49c773dbc5f9107ce4c128050b2b3593f6e4c29c7bfdf2715bc",
+  "backendVersion": "2026.3.20-managed5",
+  "backendPackageUrl": "https://claw-now.app/bootstrap/openclaw-2026.3.20-managed5.tar.gz",
+  "backendPackageSha256": "c9fb6c113ff4762d55f61b361ac7d22bba03131248ff0a1a18a4966f2157bd35"
+}
